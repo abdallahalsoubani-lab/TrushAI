@@ -25,7 +25,7 @@ import '../globals.css';
 // Type for upload analysis response
 interface UploadResult {
   input_type: string;
-  status: 'EMPTY' | 'HALF' | 'FULL';
+  status: 'EMPTY' | 'HALF' | 'FULL' | 'NO_BIN_DETECTED';
   confidence: number;
   bins_detected: number;
   message?: string;
@@ -126,6 +126,8 @@ export default function UploadPage() {
         return 'bg-orange-500';
       case 'FULL':
         return 'bg-red-500';
+      case 'NO_BIN_DETECTED':
+        return 'bg-gray-500';
       default:
         return 'bg-gray-500';
     }
@@ -140,9 +142,17 @@ export default function UploadPage() {
         return 'text-orange-600';
       case 'FULL':
         return 'text-red-600';
+      case 'NO_BIN_DETECTED':
+        return 'text-gray-600';
       default:
         return 'text-gray-600';
     }
+  };
+
+  // Format status text for display
+  const formatStatus = (status: string): string => {
+    // Replace underscores with spaces and title case
+    return status.replace(/_/g, ' ');
   };
 
   return (
@@ -268,7 +278,7 @@ export default function UploadPage() {
                       result.status
                     )}`}
                   >
-                    {result.status}
+                    {formatStatus(result.status)}
                   </p>
                 </div>
               </div>

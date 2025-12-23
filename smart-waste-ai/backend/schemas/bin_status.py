@@ -21,10 +21,17 @@ class FillLevelEnum(str, Enum):
     Fill level enumeration for API responses.
 
     Using string enum for better JSON serialization.
+
+    Values:
+    - EMPTY: Bin is empty
+    - HALF: Bin is half full
+    - FULL: Bin is full
+    - NO_BIN_DETECTED: No bin was detected in the image/video
     """
     EMPTY = "EMPTY"
     HALF = "HALF"
     FULL = "FULL"
+    NO_BIN_DETECTED = "NO_BIN_DETECTED"
 
 
 class BinStatusResponse(BaseModel):
@@ -269,6 +276,10 @@ class UploadAnalysisResponse(BaseModel):
         None,
         description="Additional information or warnings"
     )
+    debug_artifacts: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Debug artifacts (only when DEBUG_MODE enabled): overlay image, cropped bins, metadata"
+    )
 
     class Config:
         """Pydantic configuration."""
@@ -278,7 +289,12 @@ class UploadAnalysisResponse(BaseModel):
                 "status": "FULL",
                 "confidence": 0.89,
                 "bins_detected": 3,
-                "message": "Analysis complete"
+                "message": "Analysis complete",
+                "debug_artifacts": {
+                    "overlay_image": "data/results/debug/overlay_12345.jpg",
+                    "cropped_bins": ["data/results/debug/bin_0_12345.jpg"],
+                    "metadata": "data/results/debug/metadata_12345.json"
+                }
             }
         }
 

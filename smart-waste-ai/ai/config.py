@@ -154,6 +154,21 @@ class Config:
     VISUALIZATIONS_DIR = RESULTS_DIR / "visualizations"
 
     # ====================================================================
+    # DEBUG MODE CONFIGURATION
+    # ====================================================================
+
+    # Enable debug mode to save detailed artifacts for analysis
+    DEBUG_MODE: bool = os.getenv("DEBUG_MODE", "False").lower() == "true"
+
+    # Directory for debug artifacts
+    DEBUG_OUTPUT_DIR = RESULTS_DIR / "debug"
+
+    # Debug artifacts to save when DEBUG_MODE is enabled:
+    # - Overlay images with bounding boxes and labels
+    # - Cropped bin images used for classification
+    # - JSON metadata with classifier scores and thresholds
+
+    # ====================================================================
     # API CONFIGURATION
     # ====================================================================
 
@@ -180,6 +195,7 @@ class Config:
             cls.FRAMES_DIR,
             cls.RESULTS_DIR,
             cls.VISUALIZATIONS_DIR,
+            cls.DEBUG_OUTPUT_DIR,
         ]:
             dir_path.mkdir(parents=True, exist_ok=True)
 

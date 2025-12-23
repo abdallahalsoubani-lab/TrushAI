@@ -345,6 +345,147 @@ python scripts/extract_frames.py \
   --output data/frames/
 ```
 
+## 🐛 DEBUG MODE
+
+Enable debug mode to save detailed artifacts for analysis and debugging.
+
+### Enable Debug Mode
+
+```bash
+# Set environment variable
+export DEBUG_MODE=true
+
+# Or add to .env file
+echo "DEBUG_MODE=true" >> .env
+
+# Start backend
+python backend/main.py
+```
+
+### What Debug Mode Does
+
+When enabled, the `/analyze-upload` endpoint will save:
+
+1. **Overlay Image** (`data/results/debug/overlay_*.jpg`)
+   - Original image with bounding boxes
+   - Color-coded by fill level (Green=EMPTY, Orange=HALF, Red=FULL)
+   - Labels showing fill level and confidence
+
+2. **Cropped Bins** (`data/results/debug/bin_*_*.jpg`)
+   - Individual cropped images for each detected bin
+   - Exact images used for classification
+
+3. **Metadata JSON** (`data/results/debug/metadata_*.json`)
+   - Classifier name and mode
+   - Raw scores (brightness, edge density, etc.)
+   - Thresholds used for classification
+   - Bounding box coordinates
+   - Detection and classification confidence
+
+### Example Debug Artifacts
+
+```json
+{
+  "analysis_id": "20251223_143000_a1b2c3",
+  "timestamp": "2025-12-23T14:30:00",
+  "input_type": "image",
+  "bins_detected": 2,
+  "overall_status": "HALF",
+  "overall_confidence": 0.72,
+  "bins": [
+    {
+      "bin_index": 0,
+      "bbox": [100, 150, 300, 500],
+      "detection_confidence": 0.89,
+      "fill_level": "HALF",
+      "classification_confidence": 0.72,
+      "classifier_metadata": {
+        "method": "brightness",
+        "avg_brightness": 120.5,
+        "threshold_empty": 150,
+        "threshold_half": 100
+      }
+    }
+  ]
+}
+```
+
+## 📊 Evaluate Classifier Accuracy
+
+Test your classifier on a labeled dataset to measure accuracy.
+
+### Prepare Evaluation Dataset
+
+Create a folder with subfolders for each class:
+
+```
+data/evaluation_set/
+├── empty/          # Images of empty bins
+├── half/           # Images of half-full bins
+├── full/           # Images of full bins
+└── no_bin/         # Images with no bins detected
+```
+
+### Run Evaluation
+
+```bash
+python scripts/evaluate_images.py \
+  --input data/evaluation_set \
+  --output data/results/eval_report.json \
+  --mistakes data/results/mistakes \
+  --classifier brightness \
+  --max-mistakes 5
+```
+
+### Output
+
+**Evaluation Report** (`data/results/eval_report.json`):
+- Overall accuracy
+- Per-class precision, recall, F1-score
+- Confusion matrix
+- Configuration used
+
+**Mistake Examples** (`data/results/mistakes/`):
+- Images of misclassified bins
+- Filename shows: `{ground_truth}_predicted_{prediction}_{n}.jpg`
+- Text overlay with GT, prediction, and confidence
+
+### Example Output
+
+```
+EVALUATION SUMMARY
+============================================================
+Total images: 100
+Correct: 75
+Accuracy: 75.00%
+
+Per-class metrics:
+
+  EMPTY:
+    Precision: 80.00%
+    Recall:    85.00%
+    F1-score:  0.8235
+    Support:   25
+
+  HALF:
+    Precision: 70.00%
+    Recall:    65.00%
+    F1-score:  0.6744
+    Support:   25
+
+  FULL:
+    Precision: 75.00%
+    Recall:    80.00%
+    F1-score:  0.7742
+    Support:   25
+
+  NO_BIN_DETECTED:
+    Precision: 100.00%
+    Recall:    100.00%
+    F1-score:  1.0000
+    Support:   25
+```
+
 ## 📝 Mock vs Production
 
 ### Current MVP (Mock Classifier)

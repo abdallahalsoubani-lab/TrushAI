@@ -376,7 +376,7 @@ async def analyze_upload(file: UploadFile = File(...)):
             if result.bins_detected == 0:
                 return UploadAnalysisResponse(
                     input_type=input_type,
-                    status="EMPTY",
+                    status="NO_BIN_DETECTED",
                     confidence=0.0,
                     bins_detected=0,
                     message="No bins detected in video"
@@ -435,7 +435,7 @@ async def analyze_upload(file: UploadFile = File(...)):
             if not detections:
                 return UploadAnalysisResponse(
                     input_type=input_type,
-                    status="EMPTY",
+                    status="NO_BIN_DETECTED",
                     confidence=0.0,
                     bins_detected=0,
                     message="No bins detected in image"
@@ -459,12 +459,105 @@ async def analyze_upload(file: UploadFile = File(...)):
                 f"status: {fullest.fill_level.value}, confidence: {fullest.confidence:.2f}"
             )
 
+            # Generate debug artifacts if DEBUG_MODE is enabled
+            debug_artifacts = None
+            if config.DEBUG_MODE:
+                import json
+                import uuid
+                from datetime import datetime
+
+                # Generate unique ID for this analysis
+                analysis_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+
+                debug_paths = {
+                    "overlay_image": None,
+                    "cropped_bins": [],
+                    "metadata": None
+                }
+
+                # Save overlay image with bounding boxes
+                overlay_image = image.copy()
+                for i, (detection, classification) in enumerate(zip(detections, classifications)):
+                    x1, y1, x2, y2 = detection.bbox
+
+                    # Color based on fill level
+                    color_map = {
+                        FillLevel.EMPTY: (0, 255, 0),    # Green
+                        FillLevel.HALF: (0, 165, 255),   # Orange
+                        FillLevel.FULL: (0, 0, 255),     # Red
+                    }
+                    color = color_map.get(classification.fill_level, (255, 255, 255))
+
+                    # Draw bounding box
+                    cv2.rectangle(overlay_image, (x1, y1), (x2, y2), color, 2)
+
+                    # Draw label with fill level and confidence
+                    label = f"{classification.fill_level.value} ({classification.confidence:.2f})"
+                    cv2.putText(
+                        overlay_image,
+                        label,
+                        (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        color,
+                        2
+                    )
+
+                # Save overlay image
+                overlay_path = config.DEBUG_OUTPUT_DIR / f"overlay_{analysis_id}.jpg"
+                cv2.imwrite(str(overlay_path), overlay_image)
+                debug_paths["overlay_image"] = str(overlay_path)
+
+                # Save cropped bin images
+                for i, (detection, classification) in enumerate(zip(detections, classifications)):
+                    cropped = detection.crop_from_image(image)
+                    cropped_path = config.DEBUG_OUTPUT_DIR / f"bin_{i}_{analysis_id}.jpg"
+                    cv2.imwrite(str(cropped_path), cropped)
+                    debug_paths["cropped_bins"].append(str(cropped_path))
+
+                # Save metadata JSON
+                metadata = {
+                    "analysis_id": analysis_id,
+                    "timestamp": datetime.now().isoformat(),
+                    "input_type": input_type,
+                    "bins_detected": len(detections),
+                    "overall_status": fullest.fill_level.value,
+                    "overall_confidence": float(fullest.confidence),
+                    "bins": []
+                }
+
+                for i, (detection, classification) in enumerate(zip(detections, classifications)):
+                    bin_metadata = {
+                        "bin_index": i,
+                        "bbox": detection.bbox,
+                        "detection_confidence": float(detection.confidence),
+                        "fill_level": classification.fill_level.value,
+                        "classification_confidence": float(classification.confidence),
+                        "classifier_metadata": classification.metadata
+                    }
+                    metadata["bins"].append(bin_metadata)
+
+                metadata_path = config.DEBUG_OUTPUT_DIR / f"metadata_{analysis_id}.json"
+                with open(metadata_path, 'w') as f:
+                    json.dump(metadata, f, indent=2)
+                debug_paths["metadata"] = str(metadata_path)
+
+                debug_artifacts = debug_paths
+
+                logger.info(
+                    f"API: Debug artifacts saved - "
+                    f"overlay: {overlay_path}, "
+                    f"cropped: {len(debug_paths['cropped_bins'])}, "
+                    f"metadata: {metadata_path}"
+                )
+
             return UploadAnalysisResponse(
                 input_type=input_type,
                 status=fullest.fill_level.value,
                 confidence=round(fullest.confidence, 2),
                 bins_detected=len(detections),
-                message="Image analysis complete"
+                message="Image analysis complete",
+                debug_artifacts=debug_artifacts
             )
 
     except HTTPException:
