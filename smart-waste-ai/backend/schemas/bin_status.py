@@ -246,6 +246,43 @@ class HealthCheckResponse(BaseModel):
         }
 
 
+class UploadAnalysisResponse(BaseModel):
+    """
+    Response from file upload analysis.
+
+    Returned by POST /analyze-upload endpoint.
+    Simple, summarized result for uploaded videos or images.
+    """
+    input_type: str = Field(..., description="Type of input (video/image)")
+    status: FillLevelEnum = Field(..., description="Overall fill level status")
+    confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Prediction confidence (0-1)"
+    )
+    bins_detected: int = Field(
+        default=0,
+        description="Number of bins detected (0 if none found)"
+    )
+    message: Optional[str] = Field(
+        None,
+        description="Additional information or warnings"
+    )
+
+    class Config:
+        """Pydantic configuration."""
+        json_schema_extra = {
+            "example": {
+                "input_type": "video",
+                "status": "FULL",
+                "confidence": 0.89,
+                "bins_detected": 3,
+                "message": "Analysis complete"
+            }
+        }
+
+
 # TODO: Add pagination for bins list (when dealing with many bins)
 # TODO: Add filtering options (by fill level, confidence, etc.)
 # TODO: Add sorting options (by confidence, detection count, etc.)

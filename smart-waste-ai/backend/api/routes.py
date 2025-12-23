@@ -13,8 +13,10 @@ Endpoints:
 """
 
 import logging
+import tempfile
+import shutil
 from typing import Optional
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, UploadFile, File
 from pathlib import Path
 
 from backend.schemas.bin_status import (
@@ -23,7 +25,8 @@ from backend.schemas.bin_status import (
     VideoAnalysisRequest,
     VideoAnalysisResponse,
     ErrorResponse,
-    HealthCheckResponse
+    HealthCheckResponse,
+    UploadAnalysisResponse
 )
 from backend.services.inference_service import get_inference_service
 from ai.config import config
@@ -276,13 +279,223 @@ async def clear_cache():
         )
 
 
+@router.post(
+    "/analyze-upload",
+    response_model=UploadAnalysisResponse,
+    summary="Analyze Uploaded File",
+    description="Upload and analyze a video or image file to detect bins and estimate fill levels",
+    responses={
+        400: {
+            "model": ErrorResponse,
+            "description": "Invalid file format or no bins detected"
+        },
+        500: {
+            "model": ErrorResponse,
+            "description": "Analysis failed"
+        }
+    }
+)
+async def analyze_upload(file: UploadFile = File(...)):
+    """
+    Upload and analyze a video or image file.
+
+    This endpoint:
+    1. Accepts multipart/form-data file upload
+    2. Validates file type (video: mp4/avi/mov, image: jpg/png)
+    3. Saves file to temporary directory
+    4. For VIDEO: Runs full inference pipeline and returns summarized result
+    5. For IMAGE: Runs detection + classification on single frame
+    6. Returns simple status (EMPTY/HALF/FULL) with confidence
+
+    Args:
+        file: Uploaded video or image file
+
+    Returns:
+        UploadAnalysisResponse with overall status and confidence
+
+    Raises:
+        400: If file format is invalid or no bins detected
+        500: If analysis fails
+    """
+    temp_file_path = None
+
+    try:
+        service = get_inference_service()
+
+        # Validate models are loaded
+        if not service.models_loaded:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="AI models not loaded. Service initializing..."
+            )
+
+        # Validate file format
+        filename = file.filename or "upload"
+        file_ext = Path(filename).suffix.lower()
+
+        # Supported formats
+        video_extensions = ['.mp4', '.avi', '.mov', '.mkv']
+        image_extensions = ['.jpg', '.jpeg', '.png']
+        all_extensions = video_extensions + image_extensions
+
+        if file_ext not in all_extensions:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid file format. Supported: {all_extensions}"
+            )
+
+        # Determine input type
+        input_type = "video" if file_ext in video_extensions else "image"
+
+        logger.info(f"API: Analyzing uploaded {input_type}: {filename}")
+
+        # Save uploaded file to temporary directory
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=file_ext,
+            dir=tempfile.gettempdir()
+        ) as temp_file:
+            # Copy uploaded file content to temp file
+            shutil.copyfileobj(file.file, temp_file)
+            temp_file_path = temp_file.name
+
+        logger.info(f"API: Saved upload to: {temp_file_path}")
+
+        # Process based on file type
+        if input_type == "video":
+            # Use existing video analysis pipeline
+            # Process with reduced frames for faster upload analysis
+            result = service.analyze_video(
+                video_path=temp_file_path,
+                frame_skip=3,  # Process every 3 seconds for faster results
+                max_frames=30,  # Limit frames for quick analysis
+                save_visualizations=False  # Don't save visualizations for uploads
+            )
+
+            # Check if any bins were detected
+            if result.bins_detected == 0:
+                return UploadAnalysisResponse(
+                    input_type=input_type,
+                    status="EMPTY",
+                    confidence=0.0,
+                    bins_detected=0,
+                    message="No bins detected in video"
+                )
+
+            # Aggregate results to get overall status
+            # Use the most conservative (fullest) status found
+            from ai.classification.classifier_interface import FillLevel
+            level_order = {"EMPTY": 0, "HALF": 1, "FULL": 2}
+
+            bins_by_level = {}
+            total_confidence = 0.0
+
+            for bin_response in result.bins:
+                level = bin_response.fill_level.value
+                if level not in bins_by_level:
+                    bins_by_level[level] = []
+                bins_by_level[level].append(bin_response.confidence)
+                total_confidence += bin_response.confidence
+
+            # Get the fullest level detected (conservative approach)
+            overall_status = max(bins_by_level.keys(), key=lambda x: level_order[x])
+
+            # Average confidence for that level
+            avg_confidence = sum(bins_by_level[overall_status]) / len(bins_by_level[overall_status])
+
+            logger.info(
+                f"API: Video analysis complete - {result.bins_detected} bins, "
+                f"status: {overall_status}, confidence: {avg_confidence:.2f}"
+            )
+
+            return UploadAnalysisResponse(
+                input_type=input_type,
+                status=overall_status,
+                confidence=round(avg_confidence, 2),
+                bins_detected=result.bins_detected,
+                message="Video analysis complete"
+            )
+
+        else:  # image
+            # For single image: run detection + classification directly
+            import cv2
+            import numpy as np
+
+            # Read image
+            image = cv2.imread(temp_file_path)
+            if image is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Failed to read image file"
+                )
+
+            # Run detection
+            detections = service.pipeline.detector.detect(image)
+
+            if not detections:
+                return UploadAnalysisResponse(
+                    input_type=input_type,
+                    status="EMPTY",
+                    confidence=0.0,
+                    bins_detected=0,
+                    message="No bins detected in image"
+                )
+
+            # Classify each detected bin
+            classifications = []
+            for detection in detections:
+                cropped = detection.crop_from_image(image)
+                classification = service.pipeline.classifier.classify(cropped)
+                classifications.append(classification)
+
+            # Get overall status (most conservative/fullest)
+            from ai.classification.classifier_interface import FillLevel
+            level_order = {FillLevel.EMPTY: 0, FillLevel.HALF: 1, FillLevel.FULL: 2}
+
+            fullest = max(classifications, key=lambda c: level_order[c.fill_level])
+
+            logger.info(
+                f"API: Image analysis complete - {len(detections)} bins, "
+                f"status: {fullest.fill_level.value}, confidence: {fullest.confidence:.2f}"
+            )
+
+            return UploadAnalysisResponse(
+                input_type=input_type,
+                status=fullest.fill_level.value,
+                confidence=round(fullest.confidence, 2),
+                bins_detected=len(detections),
+                message="Image analysis complete"
+            )
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        logger.error(f"Upload analysis failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Upload analysis failed: {str(e)}"
+        )
+
+    finally:
+        # Clean up temporary file
+        if temp_file_path and Path(temp_file_path).exists():
+            try:
+                Path(temp_file_path).unlink()
+                logger.info(f"API: Cleaned up temp file: {temp_file_path}")
+            except Exception as e:
+                logger.warning(f"Failed to delete temp file: {e}")
+
+
 # TODO: Add async video processing with job queue
 # TODO: Add WebSocket endpoint for real-time progress updates
 # TODO: Add pagination for bins list
 # TODO: Add filtering (by fill level, confidence threshold)
 # TODO: Add sorting (by confidence, detection count)
 # TODO: Add batch video analysis endpoint
-# TODO: Add video upload endpoint (currently only accepts file paths)
 # TODO: Add authentication/authorization
 # TODO: Add rate limiting
 # TODO: Add metrics endpoint (Prometheus format)
+# TODO: Add file size limits for uploads
+# TODO: Add virus scanning for uploaded files
+# TODO: Add support for multiple file uploads

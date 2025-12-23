@@ -199,6 +199,67 @@ curl http://localhost:8000/api/v1/bins-status/bin_001
 
 Or view in the dashboard at http://localhost:3000
 
+### 6. Upload & Analyze Files (NEW!)
+
+You can now upload video or image files directly for analysis!
+
+#### Option A: Using the Dashboard (Easiest)
+
+1. Open http://localhost:3000
+2. Click **"Upload File"** button in the header
+3. Select a video (.mp4, .avi, .mov) or image (.jpg, .png)
+4. Click **"Analyze"**
+5. View the result with color-coded status:
+   - 🟢 **GREEN** = EMPTY
+   - 🟠 **ORANGE** = HALF
+   - 🔴 **RED** = FULL
+
+#### Option B: Using cURL
+
+```bash
+# Upload and analyze a video file
+curl -X POST "http://localhost:8000/api/v1/analyze-upload" \
+  -F "file=@/path/to/your/video.mp4"
+
+# Upload and analyze an image file
+curl -X POST "http://localhost:8000/api/v1/analyze-upload" \
+  -F "file=@/path/to/your/image.jpg"
+```
+
+#### Option C: Using Python
+
+```python
+import requests
+
+# Upload video
+with open('/path/to/video.mp4', 'rb') as f:
+    response = requests.post(
+        'http://localhost:8000/api/v1/analyze-upload',
+        files={'file': f}
+    )
+
+result = response.json()
+print(f"Status: {result['status']}")
+print(f"Confidence: {result['confidence']}")
+print(f"Bins detected: {result['bins_detected']}")
+```
+
+**Response Example:**
+```json
+{
+  "input_type": "video",
+  "status": "FULL",
+  "confidence": 0.89,
+  "bins_detected": 3,
+  "message": "Video analysis complete"
+}
+```
+
+**What happens:**
+- **Videos**: Analyzes frames, detects bins, returns overall status
+- **Images**: Detects bins in single frame, returns status
+- **Result**: Simple summary with EMPTY/HALF/FULL + confidence score
+
 ## 📊 API Endpoints
 
 ### Health & Status
@@ -213,7 +274,8 @@ Or view in the dashboard at http://localhost:3000
 
 ### Video Analysis
 
-- `POST /api/v1/analyze-video` - Analyze a video file
+- `POST /api/v1/analyze-video` - Analyze a video file from path
+- `POST /api/v1/analyze-upload` - **NEW!** Upload and analyze video/image file
 
 ### Utilities
 

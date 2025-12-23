@@ -20,6 +20,7 @@
  */
 
 import { useEffect, useState } from 'react';
+import Link from 'next/link';
 import './globals.css';
 
 // Type definitions matching the backend API
@@ -137,6 +138,12 @@ export default function Home() {
               </p>
             </div>
             <div className="flex items-center gap-4">
+              <Link
+                href="/upload"
+                className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition"
+              >
+                Upload File
+              </Link>
               <label className="flex items-center gap-2 text-sm">
                 <input
                   type="checkbox"
