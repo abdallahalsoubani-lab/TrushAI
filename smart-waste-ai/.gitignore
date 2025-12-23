@@ -47,6 +47,12 @@ data/frames/*
 data/results/*
 !data/results/.gitkeep
 
+# Database files
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
 # Model weights (YOLO downloads)
 *.pt
 *.pth
