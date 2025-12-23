@@ -22,6 +22,8 @@ from fastapi.responses import JSONResponse
 
 from backend.api.routes import router
 from backend.services.inference_service import get_inference_service
+from backend.database.session import init_db, check_db_connection
+from backend.config import config as backend_config
 from ai.config import config
 
 # Set up logging
@@ -47,13 +49,25 @@ async def lifespan(app: FastAPI):
     logger.info("=" * 50)
 
     try:
+        # Initialize database
+        logger.info("Initializing database...")
+        init_db()
+
+        # Check database connection
+        if check_db_connection():
+            logger.info("✓ Database connection successful")
+        else:
+            logger.warning("⚠ Database connection check failed, but continuing...")
+
         # Initialize inference service
+        logger.info("Loading AI models...")
         service = get_inference_service()
         service.initialize_models()
 
         logger.info("✓ Application startup complete")
-        logger.info(f"  API running on: http://{config.API_HOST}:{config.API_PORT}")
-        logger.info(f"  Docs available at: http://{config.API_HOST}:{config.API_PORT}/docs")
+        logger.info(f"  API running on: http://{backend_config.HOST}:{backend_config.PORT}")
+        logger.info(f"  Docs available at: http://{backend_config.HOST}:{backend_config.PORT}/docs")
+        logger.info(f"  Database: {backend_config.DATABASE_URL.split('/')[-1]}")
 
     except Exception as e:
         logger.error(f"✗ Failed to initialize application: {e}")
@@ -104,7 +118,7 @@ app = FastAPI(
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=config.CORS_ORIGINS,
+    allow_origins=backend_config.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -159,9 +173,9 @@ if __name__ == "__main__":
 
     uvicorn.run(
         "backend.main:app",
-        host=config.API_HOST,
-        port=config.API_PORT,
-        reload=config.API_RELOAD,
+        host=backend_config.HOST,
+        port=backend_config.PORT,
+        reload=backend_config.RELOAD,
         log_level=config.LOG_LEVEL.lower()
     )
 

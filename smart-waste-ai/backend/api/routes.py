@@ -15,9 +15,14 @@ Endpoints:
 import logging
 import tempfile
 import shutil
-from typing import Optional
-from fastapi import APIRouter, HTTPException, status, UploadFile, File
+import json
+import uuid
+from datetime import datetime
+from typing import Optional, List
+from fastapi import APIRouter, HTTPException, status, UploadFile, File, Depends, Query
+from fastapi.responses import FileResponse
 from pathlib import Path
+from sqlalchemy.orm import Session
 
 from backend.schemas.bin_status import (
     BinStatusResponse,
@@ -29,6 +34,9 @@ from backend.schemas.bin_status import (
     UploadAnalysisResponse
 )
 from backend.services.inference_service import get_inference_service
+from backend.database.session import get_db, check_db_connection
+from backend.services.analysis_service import AnalysisService
+from backend.config import config as backend_config
 from ai.config import config
 
 # Set up logging
@@ -46,20 +54,22 @@ router = APIRouter()
     "/health",
     response_model=HealthCheckResponse,
     summary="Health Check",
-    description="Check if the API is running and models are loaded"
+    description="Check if the API is running, models are loaded, and database is connected"
 )
 async def health_check():
     """
     Health check endpoint.
 
-    Returns service status and model availability.
+    Returns service status, model availability, and database connectivity.
     """
     service = get_inference_service()
+    db_connected = check_db_connection()
 
     return HealthCheckResponse(
-        status="healthy",
+        status="healthy" if (service.models_loaded and db_connected) else "degraded",
         version="1.0.0",
-        models_loaded=service.models_loaded
+        models_loaded=service.models_loaded,
+        database_connected=db_connected
     )
 
 
@@ -69,13 +79,42 @@ async def health_check():
     summary="Get All Bin Statuses",
     description="Retrieve status of all detected bins from the most recent analysis"
 )
-async def get_bins_status():
+async def get_bins_status(db: Session = Depends(get_db)):
     """
-    Get status of all detected bins.
+    Get status of all detected bins from the latest analysis.
 
-    Returns data from the most recent video analysis.
+    Returns data from the most recent analysis in the database.
+    If no analyses exist, returns in-memory cache for backward compatibility.
     """
     try:
+        # Try to get latest analysis from database
+        latest_analysis = AnalysisService.get_latest_analysis(db)
+
+        if latest_analysis and latest_analysis.bin_detections:
+            # Build response from database
+            bins = []
+            for bin_detection in latest_analysis.bin_detections:
+                bins.append(BinStatusResponse(
+                    bin_id=f"bin_{bin_detection.bin_index:03d}",
+                    fill_level=bin_detection.fill_level,
+                    confidence=bin_detection.confidence,
+                    location={
+                        "x1": bin_detection.bbox_x1,
+                        "y1": bin_detection.bbox_y1,
+                        "x2": bin_detection.bbox_x2,
+                        "y2": bin_detection.bbox_y2
+                    },
+                    last_updated=bin_detection.created_at,
+                    detection_count=1  # For database records, count is 1 per detection
+                ))
+
+            return BinsStatusListResponse(
+                bins=bins,
+                total_bins=len(bins),
+                timestamp=latest_analysis.completed_at or latest_analysis.started_at
+            )
+
+        # Fallback to in-memory cache for backward compatibility
         service = get_inference_service()
         return service.get_bins_status()
 
@@ -578,6 +617,223 @@ async def analyze_upload(file: UploadFile = File(...)):
                 logger.info(f"API: Cleaned up temp file: {temp_file_path}")
             except Exception as e:
                 logger.warning(f"Failed to delete temp file: {e}")
+
+
+@router.get(
+    "/analyses",
+    summary="Get Analysis History",
+    description="Retrieve list of all analyses with pagination and filtering"
+)
+async def get_analyses(
+    skip: int = Query(0, ge=0, description="Number of records to skip"),
+    limit: int = Query(20, ge=1, le=100, description="Maximum number of records to return"),
+    status_filter: Optional[str] = Query(None, description="Filter by status (EMPTY/HALF/FULL/NO_BIN_DETECTED)"),
+    input_type_filter: Optional[str] = Query(None, description="Filter by input type (image/video)"),
+    sort_by: str = Query("started_at", description="Field to sort by"),
+    sort_order: str = Query("desc", regex="^(asc|desc)$", description="Sort order"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get list of analyses with pagination and filtering.
+
+    Returns:
+        List of analyses with metadata
+    """
+    try:
+        analyses, total = AnalysisService.get_analyses(
+            db=db,
+            skip=skip,
+            limit=limit,
+            status_filter=status_filter,
+            input_type_filter=input_type_filter,
+            sort_by=sort_by,
+            sort_order=sort_order
+        )
+
+        return {
+            "analyses": [
+                {
+                    "id": analysis.id,
+                    "input_type": analysis.input_type,
+                    "original_filename": analysis.original_filename,
+                    "status": analysis.status,
+                    "confidence": analysis.confidence,
+                    "bins_detected": analysis.bins_detected,
+                    "started_at": analysis.started_at.isoformat(),
+                    "completed_at": analysis.completed_at.isoformat() if analysis.completed_at else None,
+                    "error_message": analysis.error_message,
+                    "debug_enabled": analysis.debug_enabled
+                }
+                for analysis in analyses
+            ],
+            "total": total,
+            "skip": skip,
+            "limit": limit
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting analyses: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve analyses: {str(e)}"
+        )
+
+
+@router.get(
+    "/analyses/{analysis_id}",
+    summary="Get Analysis Details",
+    description="Retrieve detailed information about a specific analysis"
+)
+async def get_analysis_details(
+    analysis_id: int,
+    db: Session = Depends(get_db)
+):
+    """
+    Get detailed information about a specific analysis.
+
+    Includes bin detections and artifacts.
+    """
+    try:
+        analysis = AnalysisService.get_analysis(db, analysis_id)
+
+        if not analysis:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Analysis {analysis_id} not found"
+            )
+
+        # Build response with all related data
+        return {
+            "id": analysis.id,
+            "input_type": analysis.input_type,
+            "original_filename": analysis.original_filename,
+            "stored_path": analysis.stored_path,
+            "status": analysis.status,
+            "confidence": analysis.confidence,
+            "bins_detected": analysis.bins_detected,
+            "started_at": analysis.started_at.isoformat(),
+            "completed_at": analysis.completed_at.isoformat() if analysis.completed_at else None,
+            "error_message": analysis.error_message,
+            "debug_enabled": analysis.debug_enabled,
+            "bin_detections": [
+                {
+                    "id": det.id,
+                    "bin_index": det.bin_index,
+                    "frame_index": det.frame_index,
+                    "bbox": {
+                        "x1": det.bbox_x1,
+                        "y1": det.bbox_y1,
+                        "x2": det.bbox_x2,
+                        "y2": det.bbox_y2
+                    },
+                    "fill_level": det.fill_level,
+                    "confidence": det.confidence,
+                    "detection_confidence": det.detection_confidence,
+                    "classifier_metadata": json.loads(det.classifier_metadata) if det.classifier_metadata else None
+                }
+                for det in analysis.bin_detections
+            ],
+            "artifacts": [
+                {
+                    "id": art.id,
+                    "type": art.type,
+                    "path": art.path,
+                    "bin_index": art.bin_index,
+                    "frame_index": art.frame_index,
+                    "file_size": art.file_size,
+                    "mime_type": art.mime_type,
+                    "created_at": art.created_at.isoformat()
+                }
+                for art in analysis.artifacts
+            ]
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        logger.error(f"Error getting analysis {analysis_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve analysis: {str(e)}"
+        )
+
+
+@router.get(
+    "/artifacts/{artifact_id}",
+    summary="Download Artifact",
+    description="Download or serve an artifact file"
+)
+async def get_artifact(
+    artifact_id: int,
+    db: Session = Depends(get_db)
+):
+    """
+    Download or serve an artifact file.
+
+    Returns the file for download or display.
+    """
+    try:
+        artifact = AnalysisService.get_artifact(db, artifact_id)
+
+        if not artifact:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Artifact {artifact_id} not found"
+            )
+
+        # Construct full path to artifact
+        file_path = backend_config.PROJECT_ROOT / artifact.path
+
+        if not file_path.exists():
+            logger.error(f"Artifact file not found: {file_path}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Artifact file not found on disk"
+            )
+
+        # Determine media type
+        media_type = artifact.mime_type or "application/octet-stream"
+
+        # Return file response
+        return FileResponse(
+            path=str(file_path),
+            media_type=media_type,
+            filename=file_path.name
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        logger.error(f"Error serving artifact {artifact_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to serve artifact: {str(e)}"
+        )
+
+
+@router.get(
+    "/analyses/summary",
+    summary="Get Analysis Summary",
+    description="Get summary statistics for all analyses"
+)
+async def get_analysis_summary(db: Session = Depends(get_db)):
+    """
+    Get summary statistics for all analyses.
+
+    Returns total counts, status breakdown, and latest analysis info.
+    """
+    try:
+        summary = AnalysisService.get_analysis_summary(db)
+        return summary
+
+    except Exception as e:
+        logger.error(f"Error getting analysis summary: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve analysis summary: {str(e)}"
+        )
 
 
 # TODO: Add async video processing with job queue

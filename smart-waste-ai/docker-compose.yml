@@ -2,9 +2,29 @@ version: '3.8'
 
 # Smart Waste Monitoring - Docker Compose
 # ========================================
-# Simple orchestration for local development
+# Production-ready orchestration with PostgreSQL
 
 services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: smart-waste-postgres
+    environment:
+      POSTGRES_DB: smart_waste
+      POSTGRES_USER: ${POSTGRES_USER:-smart_waste_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-smart_waste_password}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-smart_waste_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # Backend API
   backend:
     build:
@@ -12,36 +32,53 @@ services:
       dockerfile: Dockerfile
     container_name: smart-waste-backend
     ports:
-      - "8000:8000"
+      - "${BACKEND_PORT:-8000}:8000"
     volumes:
-      # Mount data directory for video input/output
+      # Mount data directory for file storage
       - ./data:/app/data
-      # Mount code for development (optional)
+      # Mount code for development (uncomment for hot reload)
       # - ./ai:/app/ai
       # - ./backend:/app/backend
     environment:
-      - LOG_LEVEL=INFO
-      - API_HOST=0.0.0.0
-      - API_PORT=8000
-      - YOLO_DEVICE=cpu
+      # Database
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-smart_waste_user}:${POSTGRES_PASSWORD:-smart_waste_password}@postgres:5432/smart_waste
+      # Backend
+      - BACKEND_HOST=0.0.0.0
+      - BACKEND_PORT=8000
+      - BACKEND_RELOAD=false
+      - FRONTEND_URL=http://localhost:3000
+      # File uploads
+      - MAX_UPLOAD_SIZE_MB=${MAX_UPLOAD_SIZE_MB:-100}
+      - STORE_UPLOADED_FILES=${STORE_UPLOADED_FILES:-true}
+      # Debug mode
+      - DEBUG_MODE=${DEBUG_MODE:-false}
+      # AI configuration
+      - YOLO_MODEL_SIZE=${YOLO_MODEL_SIZE:-n}
+      - YOLO_DEVICE=${YOLO_DEVICE:-cpu}
+      - MOCK_CLASSIFIER_MODE=${MOCK_CLASSIFIER_MODE:-brightness}
+      # Logging
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 40s
+      start_period: 60s
 
   # Dashboard (Next.js)
   dashboard:
     build:
       context: ./dashboard
-      dockerfile: Dockerfile.dev
+      dockerfile: Dockerfile
     container_name: smart-waste-dashboard
     ports:
-      - "3000:3000"
+      - "${DASHBOARD_PORT:-3000}:3000"
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
     depends_on:
       - backend
     restart: unless-stopped
@@ -53,7 +90,7 @@ networks:
 
 # Volumes
 volumes:
-  data:
+  postgres_data:
     driver: local
 
 # ========================================

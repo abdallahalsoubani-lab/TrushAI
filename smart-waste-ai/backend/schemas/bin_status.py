@@ -233,9 +233,10 @@ class HealthCheckResponse(BaseModel):
 
     Returned by GET /health endpoint.
     """
-    status: str = Field(..., description="Service status")
+    status: str = Field(..., description="Service status (healthy/degraded)")
     version: str = Field(..., description="API version")
     models_loaded: bool = Field(..., description="Whether AI models are loaded")
+    database_connected: bool = Field(default=False, description="Whether database is connected")
     timestamp: datetime = Field(
         default_factory=datetime.now,
         description="Health check time"
