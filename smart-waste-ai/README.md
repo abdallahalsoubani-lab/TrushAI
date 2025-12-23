@@ -14,6 +14,7 @@ This MVP demonstrates a clean, modular architecture for smart city waste monitor
 - **Analysis History**: Track all analyses with full audit trail
 - **REST API**: FastAPI backend with comprehensive endpoints for CRUD operations
 - **File Upload**: Upload and analyze videos/images via web interface
+- **Batch Upload**: Process multiple images simultaneously with aggregated results
 - **Web Dashboard**: React/Next.js UI for real-time monitoring and history
 - **Docker Deployment**: Production-ready docker-compose setup
 - **Clean Architecture**: Modular, interface-based design
@@ -303,6 +304,90 @@ print(f"Bins detected: {result['bins_detected']}")
 - **Images**: Detects bins in single frame, returns status
 - **Result**: Simple summary with EMPTY/HALF/FULL + confidence score
 
+### 7. Batch Upload (NEW!)
+
+Upload and analyze multiple images at once for bulk processing!
+
+#### Option A: Using the Dashboard (Easiest)
+
+1. Open http://localhost:3000
+2. Navigate to **Upload** page
+3. Select **"Batch Upload"** mode
+4. Choose **multiple images** (Ctrl/Cmd+Click to select multiple)
+5. Review thumbnail previews
+6. Click **"Analyze Batch"**
+7. View summary with status counts
+8. Click **"View Batch Details"** to see individual results
+
+#### Option B: Using cURL
+
+```bash
+# Upload multiple images at once
+curl -X POST "http://localhost:8000/api/v1/analyze-batch-upload" \
+  -F "files=@/path/to/image1.jpg" \
+  -F "files=@/path/to/image2.jpg" \
+  -F "files=@/path/to/image3.jpg"
+```
+
+#### Option C: Using Python
+
+```python
+import requests
+
+# Prepare files
+files = [
+    ('files', open('/path/to/image1.jpg', 'rb')),
+    ('files', open('/path/to/image2.jpg', 'rb')),
+    ('files', open('/path/to/image3.jpg', 'rb'))
+]
+
+# Upload batch
+response = requests.post(
+    'http://localhost:8000/api/v1/analyze-batch-upload',
+    files=files
+)
+
+# Close handles
+for _, f in files:
+    f.close()
+
+result = response.json()
+print(f"Batch ID: {result['batch_id']}")
+print(f"Status Counts: {result['status_counts']}")
+```
+
+**Response Example:**
+```json
+{
+  "batch_id": "batch_20250101_123045_a1b2c3d4",
+  "total_files": 3,
+  "status_counts": {
+    "EMPTY": 1,
+    "HALF": 1,
+    "FULL": 1,
+    "NO_BIN_DETECTED": 0
+  },
+  "items": [
+    {
+      "id": 1,
+      "filename": "image1.jpg",
+      "status": "EMPTY",
+      "confidence": 0.85,
+      "bins_detected": 2
+    }
+  ]
+}
+```
+
+**What you can do:**
+- Process 10-100+ images simultaneously
+- View aggregated status counts
+- Browse individual item results
+- Download artifacts (overlays, cropped bins)
+- Track batch history
+
+**See full documentation:** [BATCH_UPLOAD_GUIDE.md](BATCH_UPLOAD_GUIDE.md)
+
 ## 📊 API Endpoints
 
 ### Health & Status
@@ -319,8 +404,16 @@ print(f"Bins detected: {result['bins_detected']}")
 
 - `POST /api/v1/analyze-video` - Analyze a video file from server path
 - `POST /api/v1/analyze-upload` - Upload and analyze video/image file
+- `POST /api/v1/analyze-batch-upload` - Upload and analyze multiple images (NEW!)
 
-### Analysis History (NEW!)
+### Batch Operations (NEW!)
+
+- `GET /api/v1/batches` - List all batch uploads with pagination
+- `GET /api/v1/batches/{batch_id}` - Get batch details with summary
+- `GET /api/v1/batches/{batch_id}/items` - Get all items in a batch
+- `GET /api/v1/batch-items/{item_id}` - Get item details with artifacts
+
+### Analysis History
 
 - `GET /api/v1/analyses` - List all analyses with pagination and filtering
   - Query params: `skip`, `limit`, `status_filter`, `input_type_filter`, `sort_by`, `sort_order`
@@ -688,6 +781,9 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 - ✅ REST API
 - ✅ Dashboard
 - ✅ Clean architecture
+- ✅ File upload (single and batch)
+- ✅ Batch processing with aggregated results
+- ✅ Analysis history and artifacts
 
 ### Phase 2: Production ML
 - ⬜ Collect & label training dataset

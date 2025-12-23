@@ -3,19 +3,20 @@
 /**
  * Upload Page - File Upload and Analysis
  * =======================================
- * Allows users to upload video or image files for trash bin analysis.
+ * Allows users to upload video/image files or multiple images for batch analysis.
  *
  * Features:
- * - File input for video (.mp4, .avi, .mov) or image (.jpg, .png)
+ * - Single file upload: video (.mp4, .avi, .mov) or image (.jpg, .png)
+ * - Batch upload: multiple images (.jpg, .png, .webp)
  * - File preview (image preview or filename for video)
+ * - Thumbnails grid for batch upload
  * - Analyze button with loading state
+ * - Batch progress tracking
  * - Result display with color-coded status
+ * - Batch summary with link to details page
  * - Clear button to reset and upload another file
  *
  * TODO: Add drag-and-drop file upload
- * TODO: Add progress bar for upload
- * TODO: Add multiple file upload support
- * TODO: Display detected bins in image/video frame
  */
 
 import { useState } from 'react';
@@ -31,12 +32,43 @@ interface UploadResult {
   message?: string;
 }
 
+// Type for batch upload response
+interface BatchUploadResult {
+  batch_id: string;
+  total_files: number;
+  status_counts: {
+    EMPTY: number;
+    HALF: number;
+    FULL: number;
+    NO_BIN_DETECTED: number;
+  };
+  items: Array<{
+    id: number;
+    filename: string;
+    status: 'EMPTY' | 'HALF' | 'FULL' | 'NO_BIN_DETECTED';
+    confidence: number;
+    bins_detected: number;
+  }>;
+  internal_batch_id?: number;
+}
+
 export default function UploadPage() {
+  // Upload mode: 'single' or 'batch'
+  const [uploadMode, setUploadMode] = useState<'single' | 'batch'>('single');
+
+  // Single file upload state
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(false);
   const [result, setResult] = useState<UploadResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Batch upload state
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [filePreviews, setFilePreviews] = useState<string[]>([]);
+  const [batchLoading, setBatchLoading] = useState<boolean>(false);
+  const [batchResult, setBatchResult] = useState<BatchUploadResult | null>(null);
+  const [batchError, setBatchError] = useState<string | null>(null);
 
   // Handle file selection
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -115,6 +147,88 @@ export default function UploadPage() {
     setPreviewUrl(null);
     setResult(null);
     setError(null);
+    setSelectedFiles([]);
+    setFilePreviews([]);
+    setBatchResult(null);
+    setBatchError(null);
+  };
+
+  // Handle multiple file selection for batch upload
+  const handleBatchFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+
+    // Validate all files are images
+    const validTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+    const invalidFiles = files.filter(file => !validTypes.includes(file.type));
+
+    if (invalidFiles.length > 0) {
+      setBatchError(
+        `Invalid file types detected. Only images (JPG, PNG, WEBP) are allowed for batch upload. Invalid: ${invalidFiles.map(f => f.name).join(', ')}`
+      );
+      return;
+    }
+
+    setSelectedFiles(files);
+    setBatchError(null);
+    setBatchResult(null);
+
+    // Create previews for all images
+    const previews: string[] = [];
+    let loadedCount = 0;
+
+    files.forEach((file, index) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        previews[index] = reader.result as string;
+        loadedCount++;
+        if (loadedCount === files.length) {
+          setFilePreviews([...previews]);
+        }
+      };
+      reader.readAsDataURL(file);
+    });
+  };
+
+  // Handle batch upload and analysis
+  const handleBatchAnalyze = async () => {
+    if (selectedFiles.length === 0) return;
+
+    setBatchLoading(true);
+    setBatchError(null);
+    setBatchResult(null);
+
+    try {
+      // Create FormData with multiple files
+      const formData = new FormData();
+      selectedFiles.forEach(file => {
+        formData.append('files', file);
+      });
+
+      // Upload and analyze batch
+      const response = await fetch('http://localhost:8000/api/v1/analyze-batch-upload', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.detail || 'Batch analysis failed');
+      }
+
+      const data: BatchUploadResult = await response.json();
+      setBatchResult(data);
+    } catch (err) {
+      setBatchError(err instanceof Error ? err.message : 'Failed to analyze batch');
+    } finally {
+      setBatchLoading(false);
+    }
+  };
+
+  // Switch upload mode and clear state
+  const switchMode = (mode: 'single' | 'batch') => {
+    handleClear();
+    setUploadMode(mode);
   };
 
   // Get status color
@@ -159,14 +273,14 @@ export default function UploadPage() {
     <div className="min-h-screen bg-gray-50">
       {/* Header */}
       <header className="bg-white shadow-sm">
-        <div className="max-w-4xl mx-auto px-4 py-6 sm:px-6 lg:px-8">
+        <div className="max-w-6xl mx-auto px-4 py-6 sm:px-6 lg:px-8">
           <div className="flex justify-between items-center">
             <div>
               <h1 className="text-3xl font-bold text-gray-900">
                 Upload & Analyze
               </h1>
               <p className="text-sm text-gray-500 mt-1">
-                Upload a video or image to detect trash bin fill levels
+                Upload images or videos to detect trash bin fill levels
               </p>
             </div>
             <Link
@@ -179,9 +293,42 @@ export default function UploadPage() {
         </div>
       </header>
 
-      <main className="max-w-4xl mx-auto px-4 py-8 sm:px-6 lg:px-8">
-        {/* Upload Card */}
-        <div className="bg-white rounded-lg shadow-md p-8">
+      <main className="max-w-6xl mx-auto px-4 py-8 sm:px-6 lg:px-8">
+        {/* Mode Toggle */}
+        <div className="mb-6 bg-white rounded-lg shadow-md p-4">
+          <div className="flex items-center gap-4">
+            <span className="text-sm font-medium text-gray-700">Upload Mode:</span>
+            <div className="flex gap-2">
+              <button
+                onClick={() => switchMode('single')}
+                className={`px-4 py-2 rounded-lg transition font-medium ${
+                  uploadMode === 'single'
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                }`}
+              >
+                Single File
+              </button>
+              <button
+                onClick={() => switchMode('batch')}
+                className={`px-4 py-2 rounded-lg transition font-medium ${
+                  uploadMode === 'batch'
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                }`}
+              >
+                Batch Upload
+              </button>
+            </div>
+            <span className="text-xs text-gray-500">
+              {uploadMode === 'single' ? '(Video or Image)' : '(Multiple Images)'}
+            </span>
+          </div>
+        </div>
+
+        {/* Single File Upload Card */}
+        {uploadMode === 'single' && (
+          <div className="bg-white rounded-lg shadow-md p-8">
           {/* File Input */}
           <div className="mb-6">
             <label className="block text-sm font-medium text-gray-700 mb-2">
@@ -321,6 +468,191 @@ export default function UploadPage() {
             </div>
           )}
         </div>
+        )}
+
+        {/* Batch Upload Card */}
+        {uploadMode === 'batch' && (
+          <div className="bg-white rounded-lg shadow-md p-8">
+            {/* File Input */}
+            <div className="mb-6">
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Select Multiple Images
+              </label>
+              <input
+                type="file"
+                accept="image/jpeg,image/jpg,image/png,image/webp"
+                multiple
+                onChange={handleBatchFileChange}
+                className="block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
+              />
+              <p className="mt-2 text-xs text-gray-500">
+                Supported formats: JPG, PNG, WEBP | Select multiple images for batch processing
+              </p>
+            </div>
+
+            {/* Thumbnails Preview Grid */}
+            {selectedFiles.length > 0 && (
+              <div className="mb-6">
+                <p className="text-sm font-medium text-gray-700 mb-3">
+                  Selected Images ({selectedFiles.length})
+                </p>
+                <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 max-h-96 overflow-y-auto p-2 border border-gray-200 rounded-lg">
+                  {filePreviews.map((preview, index) => (
+                    <div key={index} className="relative group">
+                      <img
+                        src={preview}
+                        alt={`Preview ${index + 1}`}
+                        className="w-full h-32 object-cover rounded-lg border border-gray-300"
+                      />
+                      <div className="absolute bottom-0 left-0 right-0 bg-black bg-opacity-60 text-white text-xs p-1 rounded-b-lg truncate">
+                        {selectedFiles[index].name}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Action Buttons */}
+            <div className="flex gap-4">
+              <button
+                onClick={handleBatchAnalyze}
+                disabled={selectedFiles.length === 0 || batchLoading}
+                className="flex-1 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition font-medium"
+              >
+                {batchLoading ? `Analyzing... (${selectedFiles.length} images)` : 'Analyze Batch'}
+              </button>
+              <button
+                onClick={handleClear}
+                disabled={batchLoading}
+                className="px-6 py-3 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300 disabled:bg-gray-100 disabled:cursor-not-allowed transition"
+              >
+                Clear
+              </button>
+            </div>
+
+            {/* Loading State */}
+            {batchLoading && (
+              <div className="mt-6 text-center">
+                <div className="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
+                <p className="mt-4 text-gray-600">
+                  Processing {selectedFiles.length} images...
+                </p>
+              </div>
+            )}
+
+            {/* Error Display */}
+            {batchError && (
+              <div className="mt-6 bg-red-50 border border-red-200 rounded-lg p-4">
+                <p className="text-red-800 font-medium">Error</p>
+                <p className="text-sm text-red-600 mt-1">{batchError}</p>
+              </div>
+            )}
+
+            {/* Batch Result Display */}
+            {batchResult && (
+              <div className="mt-6 bg-gray-50 border border-gray-200 rounded-lg p-6">
+                <div className="flex justify-between items-start mb-4">
+                  <h3 className="text-lg font-semibold text-gray-900">
+                    Batch Analysis Complete
+                  </h3>
+                  {batchResult.internal_batch_id && (
+                    <Link
+                      href={`/batches/${batchResult.internal_batch_id}`}
+                      className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition text-sm font-medium"
+                    >
+                      View Batch Details
+                    </Link>
+                  )}
+                </div>
+
+                <div className="mb-4">
+                  <p className="text-sm text-gray-500">Batch ID</p>
+                  <p className="font-mono text-sm text-gray-900">{batchResult.batch_id}</p>
+                </div>
+
+                {/* Status Summary */}
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+                  <div className="bg-white p-4 rounded-lg border border-gray-200">
+                    <div className="flex items-center gap-2 mb-1">
+                      <div className="w-3 h-3 rounded-full bg-green-500"></div>
+                      <p className="text-xs text-gray-500">EMPTY</p>
+                    </div>
+                    <p className="text-2xl font-bold text-green-600">
+                      {batchResult.status_counts.EMPTY}
+                    </p>
+                  </div>
+                  <div className="bg-white p-4 rounded-lg border border-gray-200">
+                    <div className="flex items-center gap-2 mb-1">
+                      <div className="w-3 h-3 rounded-full bg-orange-500"></div>
+                      <p className="text-xs text-gray-500">HALF</p>
+                    </div>
+                    <p className="text-2xl font-bold text-orange-600">
+                      {batchResult.status_counts.HALF}
+                    </p>
+                  </div>
+                  <div className="bg-white p-4 rounded-lg border border-gray-200">
+                    <div className="flex items-center gap-2 mb-1">
+                      <div className="w-3 h-3 rounded-full bg-red-500"></div>
+                      <p className="text-xs text-gray-500">FULL</p>
+                    </div>
+                    <p className="text-2xl font-bold text-red-600">
+                      {batchResult.status_counts.FULL}
+                    </p>
+                  </div>
+                  <div className="bg-white p-4 rounded-lg border border-gray-200">
+                    <div className="flex items-center gap-2 mb-1">
+                      <div className="w-3 h-3 rounded-full bg-gray-500"></div>
+                      <p className="text-xs text-gray-500">NO BIN</p>
+                    </div>
+                    <p className="text-2xl font-bold text-gray-600">
+                      {batchResult.status_counts.NO_BIN_DETECTED}
+                    </p>
+                  </div>
+                </div>
+
+                {/* Items Summary Table */}
+                <div className="overflow-x-auto">
+                  <table className="min-w-full text-sm">
+                    <thead className="bg-gray-100 border-b border-gray-200">
+                      <tr>
+                        <th className="px-4 py-2 text-left font-medium text-gray-700">File</th>
+                        <th className="px-4 py-2 text-left font-medium text-gray-700">Status</th>
+                        <th className="px-4 py-2 text-left font-medium text-gray-700">Confidence</th>
+                        <th className="px-4 py-2 text-left font-medium text-gray-700">Bins</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {batchResult.items.map((item, index) => (
+                        <tr key={item.id} className="border-b border-gray-200">
+                          <td className="px-4 py-2 font-mono text-xs truncate max-w-xs">
+                            {item.filename}
+                          </td>
+                          <td className="px-4 py-2">
+                            <span
+                              className={`inline-flex items-center gap-1 px-2 py-1 rounded-full text-xs font-medium ${getStatusTextColor(
+                                item.status
+                              )}`}
+                            >
+                              <div
+                                className={`w-2 h-2 rounded-full ${getStatusColor(
+                                  item.status
+                                )}`}
+                              ></div>
+                              {formatStatus(item.status)}
+                            </span>
+                          </td>
+                          <td className="px-4 py-2">{(item.confidence * 100).toFixed(0)}%</td>
+                          <td className="px-4 py-2">{item.bins_detected}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Info Card */}
         <div className="mt-6 bg-blue-50 border border-blue-200 rounded-lg p-6">
@@ -328,15 +660,34 @@ export default function UploadPage() {
             How it works
           </h3>
           <ul className="text-sm text-blue-800 space-y-2">
-            <li>
-              • <strong>Video:</strong> Analyzes frames to detect bins and estimate fill levels
-            </li>
-            <li>
-              • <strong>Image:</strong> Detects bins in single frame and classifies fill level
-            </li>
-            <li>
-              • <strong>Result:</strong> Returns overall status (EMPTY/HALF/FULL) with confidence
-            </li>
+            {uploadMode === 'single' ? (
+              <>
+                <li>
+                  • <strong>Video:</strong> Analyzes frames to detect bins and estimate fill levels
+                </li>
+                <li>
+                  • <strong>Image:</strong> Detects bins in single frame and classifies fill level
+                </li>
+                <li>
+                  • <strong>Result:</strong> Returns overall status (EMPTY/HALF/FULL) with confidence
+                </li>
+              </>
+            ) : (
+              <>
+                <li>
+                  • <strong>Batch Upload:</strong> Process multiple images simultaneously
+                </li>
+                <li>
+                  • <strong>Analysis:</strong> Each image is analyzed independently for bin detection and fill level
+                </li>
+                <li>
+                  • <strong>Summary:</strong> View aggregated results and individual item details
+                </li>
+                <li>
+                  • <strong>Efficiency:</strong> Upload up to hundreds of images at once
+                </li>
+              </>
+            )}
             <li>
               • <strong>Note:</strong> Uses mock classifier for MVP - train with real data for production
             </li>
