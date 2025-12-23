@@ -836,6 +836,421 @@ async def get_analysis_summary(db: Session = Depends(get_db)):
         )
 
 
+@router.post(
+    "/analyze-batch-upload",
+    summary="Batch Image Upload & Analysis",
+    description="Upload multiple images at once for batch analysis"
+)
+async def analyze_batch_upload(
+    files: List[UploadFile] = File(...),
+    db: Session = Depends(get_db)
+):
+    """
+    Upload and analyze multiple images in a batch.
+
+    Only accepts image files (jpg, png, webp).
+    Processes each image and stores results in database.
+
+    Returns batch summary and individual item results.
+    """
+    from backend.services.batch_service import BatchService
+    import cv2
+    import numpy as np
+
+    # Validate file types - only images allowed
+    image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
+    batch_id_str = f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+
+    # Validate all files first
+    for file in files:
+        filename = file.filename or "upload"
+        file_ext = Path(filename).suffix.lower()
+
+        if file_ext not in image_extensions:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid file format: {filename}. Only images allowed (jpg, png, webp)"
+            )
+
+    logger.info(f"Starting batch upload {batch_id_str} with {len(files)} files")
+
+    try:
+        service = get_inference_service()
+
+        # Validate models are loaded
+        if not service.models_loaded:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="AI models not loaded. Service initializing..."
+            )
+
+        # Create batch record
+        batch = BatchService.create_batch(db, batch_id_str, len(files))
+
+        # Create batch directory
+        batch_dir = backend_config.ANALYSIS_STORAGE_DIR / batch_id_str
+        batch_dir.mkdir(parents=True, exist_ok=True)
+
+        # Process each file
+        items_summary = []
+        status_counts = {"EMPTY": 0, "HALF": 0, "FULL": 0, "NO_BIN_DETECTED": 0}
+
+        for idx, file in enumerate(files):
+            temp_file_path = None
+
+            try:
+                filename = file.filename or f"image_{idx}.jpg"
+                file_ext = Path(filename).suffix.lower()
+
+                # Save uploaded file to batch directory
+                stored_filename = f"{idx:04d}_{filename}"
+                stored_path = batch_dir / stored_filename
+                relative_path = str(stored_path.relative_to(backend_config.PROJECT_ROOT))
+
+                with open(stored_path, 'wb') as f:
+                    shutil.copyfileobj(file.file, f)
+
+                # Create batch item record
+                item = BatchService.create_batch_item(
+                    db, batch.id, filename, relative_path
+                )
+
+                # Read and analyze image
+                image = cv2.imread(str(stored_path))
+                if image is None:
+                    BatchService.update_batch_item_result(
+                        db, item.id, "NO_BIN_DETECTED", 0.0, 0,
+                        error_message="Failed to read image"
+                    )
+                    items_summary.append({
+                        "id": item.id,
+                        "filename": filename,
+                        "status": "NO_BIN_DETECTED",
+                        "error": "Failed to read image"
+                    })
+                    continue
+
+                # Run detection
+                detections = service.pipeline.detector.detect(image)
+
+                if not detections:
+                    BatchService.update_batch_item_result(
+                        db, item.id, "NO_BIN_DETECTED", 0.0, 0
+                    )
+                    status_counts["NO_BIN_DETECTED"] += 1
+                    items_summary.append({
+                        "id": item.id,
+                        "filename": filename,
+                        "status": "NO_BIN_DETECTED",
+                        "confidence": 0.0,
+                        "bins_detected": 0
+                    })
+                    continue
+
+                # Classify each detected bin
+                classifications = []
+                for detection in detections:
+                    cropped = detection.crop_from_image(image)
+                    classification = service.pipeline.classifier.classify(cropped)
+                    classifications.append(classification)
+
+                # Get overall status (most conservative/fullest)
+                from ai.classification.classifier_interface import FillLevel
+                level_order = {FillLevel.EMPTY: 0, FillLevel.HALF: 1, FillLevel.FULL: 2}
+                fullest = max(classifications, key=lambda c: level_order[c.fill_level])
+
+                # Update item with results
+                BatchService.update_batch_item_result(
+                    db, item.id,
+                    fullest.fill_level.value,
+                    fullest.confidence,
+                    len(detections)
+                )
+
+                # Update status counts
+                status_counts[fullest.fill_level.value] += 1
+
+                # Save debug artifacts if enabled
+                if backend_config.DEBUG_MODE:
+                    # Save overlay image
+                    overlay_image = image.copy()
+                    for i, (detection, classification) in enumerate(zip(detections, classifications)):
+                        x1, y1, x2, y2 = detection.bbox
+                        color_map = {
+                            FillLevel.EMPTY: (0, 255, 0),
+                            FillLevel.HALF: (0, 165, 255),
+                            FillLevel.FULL: (0, 0, 255),
+                        }
+                        color = color_map.get(classification.fill_level, (255, 255, 255))
+                        cv2.rectangle(overlay_image, (x1, y1), (x2, y2), color, 2)
+                        label = f"{classification.fill_level.value} ({classification.confidence:.2f})"
+                        cv2.putText(overlay_image, label, (x1, y1 - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+                    overlay_filename = f"overlay_{idx:04d}.jpg"
+                    overlay_path = batch_dir / overlay_filename
+                    cv2.imwrite(str(overlay_path), overlay_image)
+
+                    BatchService.add_batch_item_artifact(
+                        db, item.id, "overlay_image",
+                        str(overlay_path.relative_to(backend_config.PROJECT_ROOT)),
+                        mime_type="image/jpeg"
+                    )
+
+                # Add to summary
+                items_summary.append({
+                    "id": item.id,
+                    "filename": filename,
+                    "status": fullest.fill_level.value,
+                    "confidence": round(fullest.confidence, 2),
+                    "bins_detected": len(detections)
+                })
+
+                logger.info(f"Processed {filename}: {fullest.fill_level.value} ({len(detections)} bins)")
+
+            except Exception as e:
+                logger.error(f"Error processing {filename}: {e}", exc_info=True)
+                if 'item' in locals():
+                    BatchService.update_batch_item_result(
+                        db, item.id, "NO_BIN_DETECTED", 0.0, 0,
+                        error_message=str(e)
+                    )
+                items_summary.append({
+                    "id": item.id if 'item' in locals() else None,
+                    "filename": filename,
+                    "status": "ERROR",
+                    "error": str(e)
+                })
+
+        # Update batch with final status
+        BatchService.update_batch_status(
+            db, batch.id, "completed", status_counts
+        )
+
+        logger.info(f"Batch {batch_id_str} completed: {status_counts}")
+
+        return {
+            "batch_id": batch_id_str,
+            "batch_db_id": batch.id,
+            "total_files": len(files),
+            "status_counts": status_counts,
+            "items": items_summary
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        logger.error(f"Batch upload failed: {e}", exc_info=True)
+        if 'batch' in locals():
+            BatchService.update_batch_status(
+                db, batch.id, "failed",
+                error_message=str(e)
+            )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Batch upload failed: {str(e)}"
+        )
+
+
+@router.get(
+    "/batches",
+    summary="Get Batch Upload History",
+    description="Retrieve list of all batch uploads with pagination"
+)
+async def get_batches(
+    skip: int = Query(0, ge=0, description="Number of records to skip"),
+    limit: int = Query(20, ge=1, le=100, description="Maximum number of records"),
+    status_filter: Optional[str] = Query(None, description="Filter by processing status"),
+    db: Session = Depends(get_db)
+):
+    """Get list of batch uploads with pagination and filtering."""
+    from backend.services.batch_service import BatchService
+
+    try:
+        batches, total = BatchService.get_batches(
+            db=db,
+            skip=skip,
+            limit=limit,
+            processing_status_filter=status_filter
+        )
+
+        return {
+            "batches": [
+                {
+                    "id": batch.id,
+                    "batch_id": batch.batch_id,
+                    "total_files": batch.total_files,
+                    "status_counts": json.loads(batch.status_counts) if batch.status_counts else {},
+                    "processing_status": batch.processing_status,
+                    "created_at": batch.created_at.isoformat(),
+                    "completed_at": batch.completed_at.isoformat() if batch.completed_at else None,
+                    "failed_count": batch.failed_count
+                }
+                for batch in batches
+            ],
+            "total": total,
+            "skip": skip,
+            "limit": limit
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting batches: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve batches: {str(e)}"
+        )
+
+
+@router.get(
+    "/batches/{batch_id}",
+    summary="Get Batch Details",
+    description="Retrieve detailed information about a specific batch"
+)
+async def get_batch_details(
+    batch_id: int,
+    db: Session = Depends(get_db)
+):
+    """Get detailed information about a specific batch."""
+    from backend.services.batch_service import BatchService
+
+    try:
+        batch = BatchService.get_batch(db, batch_id)
+
+        if not batch:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Batch {batch_id} not found"
+            )
+
+        return {
+            "id": batch.id,
+            "batch_id": batch.batch_id,
+            "total_files": batch.total_files,
+            "status_counts": json.loads(batch.status_counts) if batch.status_counts else {},
+            "processing_status": batch.processing_status,
+            "created_at": batch.created_at.isoformat(),
+            "completed_at": batch.completed_at.isoformat() if batch.completed_at else None,
+            "failed_count": batch.failed_count,
+            "error_message": batch.error_message
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        logger.error(f"Error getting batch {batch_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve batch: {str(e)}"
+        )
+
+
+@router.get(
+    "/batches/{batch_id}/items",
+    summary="Get Batch Items",
+    description="Retrieve all items (images) in a batch"
+)
+async def get_batch_items(
+    batch_id: int,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db)
+):
+    """Get all items for a specific batch."""
+    from backend.services.batch_service import BatchService
+
+    try:
+        items, total = BatchService.get_batch_items(db, batch_id, skip, limit)
+
+        return {
+            "items": [
+                {
+                    "id": item.id,
+                    "batch_id": item.batch_id,
+                    "filename": item.original_filename,
+                    "status": item.status,
+                    "confidence": item.confidence,
+                    "bins_detected": item.bins_detected,
+                    "processing_status": item.processing_status,
+                    "created_at": item.created_at.isoformat(),
+                    "completed_at": item.completed_at.isoformat() if item.completed_at else None,
+                    "error_message": item.error_message,
+                    "artifact_count": len(item.artifacts)
+                }
+                for item in items
+            ],
+            "total": total,
+            "skip": skip,
+            "limit": limit
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting batch items for {batch_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve batch items: {str(e)}"
+        )
+
+
+@router.get(
+    "/batch-items/{item_id}",
+    summary="Get Batch Item Details",
+    description="Retrieve detailed information about a specific batch item"
+)
+async def get_batch_item_details(
+    item_id: int,
+    db: Session = Depends(get_db)
+):
+    """Get detailed information about a specific batch item."""
+    from backend.services.batch_service import BatchService
+
+    try:
+        item = BatchService.get_batch_item(db, item_id)
+
+        if not item:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Batch item {item_id} not found"
+            )
+
+        return {
+            "id": item.id,
+            "batch_id": item.batch_id,
+            "filename": item.original_filename,
+            "stored_path": item.stored_path,
+            "status": item.status,
+            "confidence": item.confidence,
+            "bins_detected": item.bins_detected,
+            "processing_status": item.processing_status,
+            "created_at": item.created_at.isoformat(),
+            "completed_at": item.completed_at.isoformat() if item.completed_at else None,
+            "error_message": item.error_message,
+            "artifacts": [
+                {
+                    "id": art.id,
+                    "type": art.type,
+                    "path": art.path,
+                    "bin_index": art.bin_index,
+                    "file_size": art.file_size,
+                    "mime_type": art.mime_type,
+                    "created_at": art.created_at.isoformat()
+                }
+                for art in item.artifacts
+            ]
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        logger.error(f"Error getting batch item {item_id}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve batch item: {str(e)}"
+        )
+
+
 # TODO: Add async video processing with job queue
 # TODO: Add WebSocket endpoint for real-time progress updates
 # TODO: Add pagination for bins list
@@ -847,4 +1262,3 @@ async def get_analysis_summary(db: Session = Depends(get_db)):
 # TODO: Add metrics endpoint (Prometheus format)
 # TODO: Add file size limits for uploads
 # TODO: Add virus scanning for uploaded files
-# TODO: Add support for multiple file uploads
