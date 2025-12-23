@@ -1,0 +1,72 @@
+# ============================================================================
+# Smart Waste Monitoring System - Python Dependencies
+# ============================================================================
+#
+# Installation:
+#   pip install -r requirements.txt
+#
+# For GPU support (CUDA):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#
+# ============================================================================
+
+# Core Framework
+# ----------------------------------------------------------------------------
+python-multipart>=0.0.6      # File upload support for FastAPI
+fastapi>=0.104.0             # Web framework for API
+uvicorn[standard]>=0.24.0    # ASGI server for FastAPI
+pydantic>=2.5.0              # Data validation and serialization
+
+# Computer Vision & AI
+# ----------------------------------------------------------------------------
+opencv-python>=4.8.0         # Computer vision library
+ultralytics>=8.0.0           # YOLOv8 object detection
+torch>=2.1.0                 # PyTorch deep learning framework
+torchvision>=0.16.0          # PyTorch vision utilities
+numpy>=1.24.0                # Numerical computing
+
+# Utilities
+# ----------------------------------------------------------------------------
+python-dotenv>=1.0.0         # Environment variables management
+Pillow>=10.1.0               # Image processing utilities
+
+# Development & Testing (Optional)
+# ----------------------------------------------------------------------------
+# pytest>=7.4.0              # Testing framework
+# pytest-cov>=4.1.0          # Code coverage
+# black>=23.11.0             # Code formatting
+# flake8>=6.1.0              # Linting
+# mypy>=1.7.0                # Type checking
+
+# ============================================================================
+# Version Compatibility Notes
+# ============================================================================
+#
+# Python: Requires Python 3.10 or higher
+#
+# YOLO Models:
+#   - YOLOv8n (nano): Fastest, ~6MB
+#   - YOLOv8s (small): Balanced, ~22MB
+#   - YOLOv8m (medium): More accurate, ~52MB
+#   - YOLOv8l (large): High accuracy, ~88MB
+#   - YOLOv8x (xlarge): Best accuracy, ~136MB
+#
+# GPU Support:
+#   - For NVIDIA GPUs: Install CUDA toolkit and PyTorch with CUDA
+#   - For Apple Silicon (M1/M2): PyTorch with MPS support is included
+#   - For CPU only: The above dependencies work out of the box
+#
+# ============================================================================
+# TODO: Add dependencies for production deployment
+# ============================================================================
+#
+# - redis>=5.0.0                  # Caching layer
+# - celery>=5.3.0                 # Async task queue
+# - sqlalchemy>=2.0.0             # Database ORM
+# - alembic>=1.12.0               # Database migrations
+# - prometheus-client>=0.19.0     # Metrics collection
+# - python-jose[cryptography]     # JWT authentication
+# - passlib[bcrypt]               # Password hashing
+# - boto3>=1.29.0                 # AWS S3 for video storage
+#
+# ============================================================================

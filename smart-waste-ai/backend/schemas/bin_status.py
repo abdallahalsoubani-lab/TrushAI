@@ -1,0 +1,255 @@
+"""
+Pydantic Schemas for Bin Status API
+====================================
+Type-safe data models for API requests and responses.
+
+These schemas ensure:
+- Input validation
+- Output serialization
+- API documentation (OpenAPI/Swagger)
+- Type safety throughout the application
+"""
+
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field, validator
+from enum import Enum
+from datetime import datetime
+
+
+class FillLevelEnum(str, Enum):
+    """
+    Fill level enumeration for API responses.
+
+    Using string enum for better JSON serialization.
+    """
+    EMPTY = "EMPTY"
+    HALF = "HALF"
+    FULL = "FULL"
+
+
+class BinStatusResponse(BaseModel):
+    """
+    Individual bin status information.
+
+    Returned by GET /bins-status endpoint.
+    """
+    bin_id: str = Field(..., description="Unique bin identifier")
+    fill_level: FillLevelEnum = Field(..., description="Current fill level")
+    confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Prediction confidence (0-1)"
+    )
+    location: Optional[Dict[str, int]] = Field(
+        None,
+        description="Bin location as bounding box {x1, y1, x2, y2}"
+    )
+    last_updated: datetime = Field(
+        default_factory=datetime.now,
+        description="Last update timestamp"
+    )
+    detection_count: int = Field(
+        ...,
+        ge=1,
+        description="Number of times detected across frames"
+    )
+
+    class Config:
+        """Pydantic configuration."""
+        json_schema_extra = {
+            "example": {
+                "bin_id": "bin_001",
+                "fill_level": "HALF",
+                "confidence": 0.85,
+                "location": {"x1": 100, "y1": 150, "x2": 300, "y2": 500},
+                "last_updated": "2025-12-23T10:30:00",
+                "detection_count": 5
+            }
+        }
+
+
+class BinsStatusListResponse(BaseModel):
+    """
+    List of all bin statuses.
+
+    Response for GET /bins-status endpoint.
+    """
+    bins: List[BinStatusResponse] = Field(..., description="List of all bins")
+    total_bins: int = Field(..., description="Total number of bins detected")
+    timestamp: datetime = Field(
+        default_factory=datetime.now,
+        description="Response generation time"
+    )
+
+    class Config:
+        """Pydantic configuration."""
+        json_schema_extra = {
+            "example": {
+                "bins": [
+                    {
+                        "bin_id": "bin_001",
+                        "fill_level": "HALF",
+                        "confidence": 0.85,
+                        "location": {"x1": 100, "y1": 150, "x2": 300, "y2": 500},
+                        "last_updated": "2025-12-23T10:30:00",
+                        "detection_count": 5
+                    }
+                ],
+                "total_bins": 1,
+                "timestamp": "2025-12-23T10:30:00"
+            }
+        }
+
+
+class VideoAnalysisRequest(BaseModel):
+    """
+    Request to analyze a video file.
+
+    Body for POST /analyze-video endpoint.
+    """
+    video_path: str = Field(
+        ...,
+        description="Path to video file (must exist on server)"
+    )
+    frame_skip: Optional[int] = Field(
+        None,
+        ge=1,
+        le=30,
+        description="Process every Nth second of video"
+    )
+    max_frames: Optional[int] = Field(
+        None,
+        ge=1,
+        le=1000,
+        description="Maximum number of frames to process"
+    )
+    save_visualizations: Optional[bool] = Field(
+        None,
+        description="Whether to save result visualizations"
+    )
+
+    @validator('video_path')
+    def validate_video_path(cls, v):
+        """Validate video path format."""
+        if not v or len(v.strip()) == 0:
+            raise ValueError("Video path cannot be empty")
+        return v.strip()
+
+    class Config:
+        """Pydantic configuration."""
+        json_schema_extra = {
+            "example": {
+                "video_path": "/path/to/video.mp4",
+                "frame_skip": 2,
+                "max_frames": 50,
+                "save_visualizations": True
+            }
+        }
+
+
+class VideoAnalysisResponse(BaseModel):
+    """
+    Response from video analysis.
+
+    Returned by POST /analyze-video endpoint.
+    """
+    job_id: str = Field(..., description="Unique job identifier")
+    status: str = Field(..., description="Job status (completed/failed)")
+    video_path: str = Field(..., description="Analyzed video path")
+    total_frames: int = Field(..., description="Total frames in video")
+    processed_frames: int = Field(..., description="Frames actually processed")
+    bins_detected: int = Field(..., description="Number of bins detected")
+    bins: List[BinStatusResponse] = Field(..., description="Detected bins with status")
+    processing_time: float = Field(..., description="Processing time in seconds")
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Additional processing metadata"
+    )
+
+    class Config:
+        """Pydantic configuration."""
+        json_schema_extra = {
+            "example": {
+                "job_id": "job_20251223_103000",
+                "status": "completed",
+                "video_path": "/path/to/video.mp4",
+                "total_frames": 300,
+                "processed_frames": 50,
+                "bins_detected": 3,
+                "bins": [
+                    {
+                        "bin_id": "bin_001",
+                        "fill_level": "HALF",
+                        "confidence": 0.85,
+                        "location": {"x1": 100, "y1": 150, "x2": 300, "y2": 500},
+                        "last_updated": "2025-12-23T10:30:00",
+                        "detection_count": 5
+                    }
+                ],
+                "processing_time": 15.3,
+                "metadata": {
+                    "detector": "YOLOv8n",
+                    "classifier": "brightness"
+                }
+            }
+        }
+
+
+class ErrorResponse(BaseModel):
+    """
+    Standard error response.
+
+    Returned when an error occurs.
+    """
+    error: str = Field(..., description="Error message")
+    detail: Optional[str] = Field(None, description="Detailed error information")
+    timestamp: datetime = Field(
+        default_factory=datetime.now,
+        description="Error occurrence time"
+    )
+
+    class Config:
+        """Pydantic configuration."""
+        json_schema_extra = {
+            "example": {
+                "error": "Video not found",
+                "detail": "The specified video file does not exist",
+                "timestamp": "2025-12-23T10:30:00"
+            }
+        }
+
+
+class HealthCheckResponse(BaseModel):
+    """
+    Health check response.
+
+    Returned by GET /health endpoint.
+    """
+    status: str = Field(..., description="Service status")
+    version: str = Field(..., description="API version")
+    models_loaded: bool = Field(..., description="Whether AI models are loaded")
+    timestamp: datetime = Field(
+        default_factory=datetime.now,
+        description="Health check time"
+    )
+
+    class Config:
+        """Pydantic configuration."""
+        json_schema_extra = {
+            "example": {
+                "status": "healthy",
+                "version": "1.0.0",
+                "models_loaded": True,
+                "timestamp": "2025-12-23T10:30:00"
+            }
+        }
+
+
+# TODO: Add pagination for bins list (when dealing with many bins)
+# TODO: Add filtering options (by fill level, confidence, etc.)
+# TODO: Add sorting options (by confidence, detection count, etc.)
+# TODO: Add WebSocket schema for real-time updates
+# TODO: Add batch video analysis schema
+# TODO: Add historical data schema (fill level over time)
+# TODO: Add alert/notification schema (when bin is full)

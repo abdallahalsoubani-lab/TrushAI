@@ -1,0 +1,478 @@
+"""
+Inference Pipeline
+==================
+Orchestrates the complete video analysis workflow:
+1. Extract frames from video
+2. Detect trash bins in each frame
+3. Classify fill level for each detected bin
+4. Track bins across frames
+5. Aggregate predictions using voting
+6. Generate final results
+
+This is the main entry point for the AI system.
+"""
+
+import logging
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass, field
+from collections import defaultdict
+import cv2
+import numpy as np
+
+from ai.detection.yolo_detector import YOLOv8Detector
+from ai.detection.detector_interface import Detection
+from ai.classification.fill_level_classifier import get_classifier
+from ai.classification.classifier_interface import FillLevel, ClassificationResult
+from ai.config import config
+
+# Set up logging
+logging.basicConfig(
+    level=config.LOG_LEVEL,
+    format=config.LOG_FORMAT
+)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BinInstance:
+    """
+    Represents a tracked bin across multiple frames.
+
+    Attributes:
+        bin_id: Unique identifier for this bin
+        detections: List of detections across frames
+        classifications: List of classification results
+        frame_indices: Frame numbers where this bin was detected
+        final_bbox: Representative bounding box (average position)
+        final_fill_level: Aggregated fill level prediction
+        confidence: Aggregated confidence score
+    """
+    bin_id: str
+    detections: List[Detection] = field(default_factory=list)
+    classifications: List[ClassificationResult] = field(default_factory=list)
+    frame_indices: List[int] = field(default_factory=list)
+    final_bbox: Optional[Tuple[int, int, int, int]] = None
+    final_fill_level: Optional[FillLevel] = None
+    confidence: Optional[float] = None
+
+
+@dataclass
+class PipelineResult:
+    """
+    Complete pipeline output for a video.
+
+    Attributes:
+        video_path: Path to analyzed video
+        total_frames: Total frames in video
+        processed_frames: Number of frames actually processed
+        bins: List of detected and classified bins
+        processing_time: Total processing time in seconds
+        metadata: Additional information
+    """
+    video_path: str
+    total_frames: int
+    processed_frames: int
+    bins: List[BinInstance]
+    processing_time: float
+    metadata: Dict = field(default_factory=dict)
+
+
+class InferencePipeline:
+    """
+    Main pipeline for video analysis.
+
+    Coordinates detection, classification, tracking, and aggregation.
+    """
+
+    def __init__(
+        self,
+        detector: Optional[YOLOv8Detector] = None,
+        classifier_mode: Optional[str] = None
+    ):
+        """
+        Initialize inference pipeline.
+
+        Args:
+            detector: Object detector (creates default if None)
+            classifier_mode: Classifier mode (uses config default if None)
+        """
+        self.detector = detector or YOLOv8Detector()
+        self.classifier = get_classifier(classifier_mode)
+
+        # Ensure models are loaded
+        if not self.detector.is_loaded():
+            logger.info("Loading detector...")
+            self.detector.load_model()
+
+        if not self.classifier.is_loaded():
+            logger.info("Loading classifier...")
+            self.classifier.load_model()
+
+        logger.info("Inference pipeline initialized")
+
+    def process_video(
+        self,
+        video_path: str,
+        frame_skip: Optional[int] = None,
+        max_frames: Optional[int] = None,
+        save_visualizations: bool = None
+    ) -> PipelineResult:
+        """
+        Process entire video and return bin status.
+
+        Args:
+            video_path: Path to input video file
+            frame_skip: Process every Nth frame (uses config default if None)
+            max_frames: Maximum frames to process (uses config default if None)
+            save_visualizations: Whether to save visualizations
+
+        Returns:
+            PipelineResult with all detected bins and their status
+
+        Raises:
+            FileNotFoundError: If video file doesn't exist
+            Exception: If video processing fails
+        """
+        import time
+
+        start_time = time.time()
+
+        video_path = Path(video_path)
+        if not video_path.exists():
+            raise FileNotFoundError(f"Video not found: {video_path}")
+
+        logger.info(f"Processing video: {video_path.name}")
+
+        # Extract and process frames
+        frames = self._extract_frames(
+            video_path,
+            frame_skip=frame_skip,
+            max_frames=max_frames
+        )
+
+        logger.info(f"Extracted {len(frames)} frames for processing")
+
+        # Process each frame
+        all_detections = []
+        for frame_idx, frame in enumerate(frames):
+            frame_detections = self._process_frame(frame, frame_idx)
+            all_detections.append(frame_detections)
+
+            logger.debug(
+                f"Frame {frame_idx}: {len(frame_detections)} bins detected"
+            )
+
+        # Track bins across frames
+        tracked_bins = self._track_bins_across_frames(all_detections)
+
+        logger.info(f"Tracked {len(tracked_bins)} unique bins")
+
+        # Aggregate predictions for each bin
+        for bin_instance in tracked_bins:
+            self._aggregate_bin_predictions(bin_instance)
+
+        # Save visualizations if requested
+        if save_visualizations or (save_visualizations is None and config.SAVE_VISUALIZATIONS):
+            self._save_visualizations(frames, tracked_bins, video_path.stem)
+
+        processing_time = time.time() - start_time
+
+        logger.info(
+            f"Video processing complete in {processing_time:.2f}s "
+            f"({len(tracked_bins)} bins detected)"
+        )
+
+        return PipelineResult(
+            video_path=str(video_path),
+            total_frames=len(frames),
+            processed_frames=len(frames),
+            bins=tracked_bins,
+            processing_time=processing_time,
+            metadata={
+                "detector": self.detector.get_model_info(),
+                "classifier": self.classifier.get_model_info(),
+                "frame_skip": frame_skip or "default",
+            }
+        )
+
+    def _extract_frames(
+        self,
+        video_path: Path,
+        frame_skip: Optional[int] = None,
+        max_frames: Optional[int] = None
+    ) -> List[np.ndarray]:
+        """
+        Extract frames from video.
+
+        Args:
+            video_path: Path to video
+            frame_skip: Extract every Nth frame
+            max_frames: Maximum frames to extract
+
+        Returns:
+            List of frame images
+        """
+        frame_skip = frame_skip or config.FRAME_EXTRACTION_RATE
+        max_frames = max_frames or config.MAX_FRAMES_PER_VIDEO
+
+        cap = cv2.VideoCapture(str(video_path))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        skip_frames = int(fps * frame_skip)
+
+        frames = []
+        frame_count = 0
+
+        while cap.isOpened() and len(frames) < max_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_count % skip_frames == 0:
+                frames.append(frame)
+
+            frame_count += 1
+
+        cap.release()
+        return frames
+
+    def _process_frame(
+        self,
+        frame: np.ndarray,
+        frame_idx: int
+    ) -> List[Tuple[Detection, ClassificationResult]]:
+        """
+        Process a single frame: detect and classify bins.
+
+        Args:
+            frame: Input frame image
+            frame_idx: Frame index
+
+        Returns:
+            List of (Detection, ClassificationResult) tuples
+        """
+        # Detect bins in frame
+        detections = self.detector.detect(frame)
+
+        results = []
+        for detection in detections:
+            # Crop bin from frame
+            cropped_bin = detection.crop_from_image(frame)
+
+            # Classify fill level
+            try:
+                classification = self.classifier.classify(cropped_bin)
+                results.append((detection, classification))
+            except Exception as e:
+                logger.warning(
+                    f"Classification failed for bin in frame {frame_idx}: {e}"
+                )
+
+        return results
+
+    def _track_bins_across_frames(
+        self,
+        all_detections: List[List[Tuple[Detection, ClassificationResult]]]
+    ) -> List[BinInstance]:
+        """
+        Track same bins across multiple frames using IoU matching.
+
+        Args:
+            all_detections: Detections for each frame
+
+        Returns:
+            List of tracked bin instances
+        """
+        tracked_bins: List[BinInstance] = []
+        next_bin_id = 0
+
+        for frame_idx, frame_detections in enumerate(all_detections):
+            for detection, classification in frame_detections:
+                # Find matching bin in tracked bins
+                matched_bin = None
+                max_iou = 0.0
+
+                for bin_instance in tracked_bins:
+                    if not bin_instance.detections:
+                        continue
+
+                    # Compare with last detection of this bin
+                    last_detection = bin_instance.detections[-1]
+                    iou = detection.iou(last_detection)
+
+                    if iou > config.BIN_TRACKING_IOU_THRESHOLD and iou > max_iou:
+                        matched_bin = bin_instance
+                        max_iou = iou
+
+                if matched_bin:
+                    # Add to existing bin
+                    matched_bin.detections.append(detection)
+                    matched_bin.classifications.append(classification)
+                    matched_bin.frame_indices.append(frame_idx)
+                else:
+                    # Create new bin
+                    new_bin = BinInstance(
+                        bin_id=f"bin_{next_bin_id:03d}",
+                        detections=[detection],
+                        classifications=[classification],
+                        frame_indices=[frame_idx]
+                    )
+                    tracked_bins.append(new_bin)
+                    next_bin_id += 1
+
+        # Filter out bins with too few detections (likely false positives)
+        min_detections = config.MIN_DETECTIONS_FOR_VALID_BIN
+        valid_bins = [
+            b for b in tracked_bins
+            if len(b.detections) >= min_detections
+        ]
+
+        logger.info(
+            f"Filtered bins: {len(tracked_bins)} → {len(valid_bins)} "
+            f"(min detections: {min_detections})"
+        )
+
+        return valid_bins
+
+    def _aggregate_bin_predictions(self, bin_instance: BinInstance) -> None:
+        """
+        Aggregate predictions across frames using voting strategy.
+
+        Args:
+            bin_instance: Bin instance to aggregate
+        """
+        if not bin_instance.classifications:
+            return
+
+        strategy = config.VOTING_STRATEGY
+
+        if strategy == "majority":
+            # Most common prediction
+            fill_levels = [c.fill_level for c in bin_instance.classifications]
+            bin_instance.final_fill_level = max(
+                set(fill_levels),
+                key=fill_levels.count
+            )
+            # Average confidence for the predicted level
+            confidences = [
+                c.confidence for c in bin_instance.classifications
+                if c.fill_level == bin_instance.final_fill_level
+            ]
+            bin_instance.confidence = np.mean(confidences)
+
+        elif strategy == "conservative":
+            # Choose fullest level (safety-first approach)
+            level_order = {FillLevel.EMPTY: 0, FillLevel.HALF: 1, FillLevel.FULL: 2}
+            fill_levels = [c.fill_level for c in bin_instance.classifications]
+            bin_instance.final_fill_level = max(fill_levels, key=lambda x: level_order[x])
+            confidences = [
+                c.confidence for c in bin_instance.classifications
+                if c.fill_level == bin_instance.final_fill_level
+            ]
+            bin_instance.confidence = np.mean(confidences) if confidences else 0.5
+
+        elif strategy == "latest":
+            # Use most recent prediction
+            latest = bin_instance.classifications[-1]
+            bin_instance.final_fill_level = latest.fill_level
+            bin_instance.confidence = latest.confidence
+
+        else:
+            raise ValueError(f"Unknown voting strategy: {strategy}")
+
+        # Calculate average bounding box
+        all_bboxes = np.array([d.bbox for d in bin_instance.detections])
+        avg_bbox = np.mean(all_bboxes, axis=0).astype(int)
+        bin_instance.final_bbox = tuple(avg_bbox)
+
+    def _save_visualizations(
+        self,
+        frames: List[np.ndarray],
+        bins: List[BinInstance],
+        video_name: str
+    ) -> None:
+        """
+        Save visualization images with detections and classifications.
+
+        Args:
+            frames: All frames
+            bins: Tracked bins
+            video_name: Video name for file naming
+        """
+        vis_dir = config.VISUALIZATIONS_DIR
+        vis_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create visualization for a representative frame (middle frame)
+        if not frames:
+            return
+
+        mid_frame_idx = len(frames) // 2
+        vis_frame = frames[mid_frame_idx].copy()
+
+        # Draw all bins detected in this frame
+        for bin_instance in bins:
+            if mid_frame_idx not in bin_instance.frame_indices:
+                continue
+
+            # Find detection for this frame
+            frame_pos = bin_instance.frame_indices.index(mid_frame_idx)
+            detection = bin_instance.detections[frame_pos]
+            x1, y1, x2, y2 = detection.bbox
+
+            # Color based on fill level
+            color_map = {
+                FillLevel.EMPTY: (0, 255, 0),    # Green
+                FillLevel.HALF: (0, 165, 255),   # Orange
+                FillLevel.FULL: (0, 0, 255),     # Red
+            }
+            color = color_map.get(bin_instance.final_fill_level, (255, 255, 255))
+
+            # Draw bounding box
+            cv2.rectangle(vis_frame, (x1, y1), (x2, y2), color, 3)
+
+            # Draw label
+            label = f"{bin_instance.bin_id}: {bin_instance.final_fill_level.value}"
+            cv2.putText(
+                vis_frame,
+                label,
+                (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2
+            )
+
+        # Save visualization
+        vis_path = vis_dir / f"{video_name}_result.jpg"
+        cv2.imwrite(str(vis_path), vis_frame)
+        logger.info(f"Visualization saved: {vis_path}")
+
+
+# TODO: Add support for real-time video streams
+# TODO: Implement Kalman filter for smoother tracking
+# TODO: Add re-identification for bins that disappear and reappear
+# TODO: Add multi-camera support and view fusion
+# TODO: Add anomaly detection (unusual fill patterns)
+# TODO: Add time-series analysis for fill rate prediction
+# TODO: Add geographic clustering (bins in same area)
+# TODO: Optimize with multi-threading/multi-processing
+# TODO: Add support for GPU batch processing
+
+
+if __name__ == "__main__":
+    """
+    Test script for inference pipeline.
+
+    Usage:
+        python -m ai.inference.pipeline
+    """
+    print("Inference Pipeline Test")
+    print("=" * 50)
+
+    # Initialize pipeline
+    pipeline = InferencePipeline()
+
+    print("\n✓ Pipeline initialized successfully")
+    print(f"  Detector: {pipeline.detector.get_model_info()['name']}")
+    print(f"  Classifier: {pipeline.classifier.get_model_info()['name']}")
+    print("\nReady to process videos!")
