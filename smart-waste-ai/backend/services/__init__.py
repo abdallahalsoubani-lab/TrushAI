@@ -7,5 +7,6 @@ Provides service classes for handling database operations.
 """
 
 from .analysis_service import AnalysisService
+from .batch_service import BatchService
 
-__all__ = ["AnalysisService"]
+__all__ = ["AnalysisService", "BatchService"]
