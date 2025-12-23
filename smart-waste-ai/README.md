@@ -10,9 +10,15 @@ This MVP demonstrates a clean, modular architecture for smart city waste monitor
 
 - **Object Detection**: YOLOv8-based trash bin detection
 - **Fill Level Classification**: Mock classifier using brightness/edge density heuristics
-- **REST API**: FastAPI backend with comprehensive endpoints
-- **Web Dashboard**: React/Next.js UI for real-time monitoring
+- **Database Persistence**: PostgreSQL/SQLite support with Alembic migrations
+- **Analysis History**: Track all analyses with full audit trail
+- **REST API**: FastAPI backend with comprehensive endpoints for CRUD operations
+- **File Upload**: Upload and analyze videos/images via web interface
+- **Web Dashboard**: React/Next.js UI for real-time monitoring and history
+- **Docker Deployment**: Production-ready docker-compose setup
 - **Clean Architecture**: Modular, interface-based design
+- **Debug Mode**: Save overlay images, cropped bins, and metadata for analysis
+- **Evaluation Tools**: Built-in accuracy testing and confusion matrix generation
 - **Future-Ready**: Extensive TODOs for production ML models
 
 ## 🏗️ Architecture
@@ -99,52 +105,89 @@ smart-waste-ai/
 
 ## 🚀 Quick Start
 
-### Prerequisites
+### Option 1: Using Run Script (Recommended)
 
-- **Python**: 3.10 or higher
-- **Node.js**: 18+ (for dashboard)
-- **pip**: Python package manager
-- **npm**: Node package manager
-
-### 1. Clone & Setup
+The easiest way to get started:
 
 ```bash
 # Navigate to project
 cd smart-waste-ai
 
+# Start with Docker (includes PostgreSQL)
+./run.sh start
+
+# OR start in local development mode (uses SQLite)
+./run.sh start local
+```
+
+**Access points:**
+- Dashboard: http://localhost:3000
+- Backend API: http://localhost:8000
+- API Docs: http://localhost:8000/docs
+- PostgreSQL: localhost:5432 (Docker mode only)
+
+**Useful commands:**
+```bash
+./run.sh status    # Check service status
+./run.sh logs      # View logs (Docker mode)
+./run.sh stop      # Stop all services
+./run.sh migrate   # Run database migrations
+./run.sh help      # Show all commands
+```
+
+### Option 2: Manual Setup
+
+#### Prerequisites
+
+- **Docker & Docker Compose**: For production deployment (recommended)
+- **Python**: 3.10 or higher (for local development)
+- **Node.js**: 18+ (for dashboard)
+- **PostgreSQL**: 15+ (optional, SQLite used by default)
+
+#### Docker Deployment
+
+```bash
+# Copy environment file
+cp .env.example .env
+
+# Start all services (PostgreSQL + Backend + Dashboard)
+docker-compose up -d
+
+# Run database migrations
+docker-compose exec backend alembic upgrade head
+
+# View logs
+docker-compose logs -f
+```
+
+#### Local Development
+
+```bash
 # Create virtual environment
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 # Install Python dependencies
 pip install -r requirements.txt
-```
 
-### 2. Start Backend API
+# Run database migrations
+cd backend
+alembic upgrade head
+cd ..
 
-```bash
-# From project root
+# Start backend
 python backend/main.py
-```
 
-The API will start on `http://localhost:8000`
-- API Docs: http://localhost:8000/docs
-- Health Check: http://localhost:8000/api/v1/health
-
-### 3. Start Dashboard (Optional)
-
-```bash
-# Navigate to dashboard
+# In another terminal, start dashboard
 cd dashboard
-
-# Install dependencies (first time only)
 npm install
-
-# Start development server
 npm run dev
 ```
 
-Dashboard will be available at `http://localhost:3000`
+**Access points:**
+- Dashboard: http://localhost:3000
+- Backend API: http://localhost:8000
+- API Docs: http://localhost:8000/docs
 
 ### 4. Analyze a Video
 
@@ -264,26 +307,65 @@ print(f"Bins detected: {result['bins_detected']}")
 
 ### Health & Status
 
-- `GET /health` - Health check
+- `GET /api/v1/health` - Health check (includes database connectivity)
 - `GET /api/v1/service-info` - Service information
 
-### Bin Status
+### Bin Status (Real-time)
 
-- `GET /api/v1/bins-status` - Get all bin statuses
+- `GET /api/v1/bins-status` - Get all bin statuses from latest analysis
 - `GET /api/v1/bins-status/{bin_id}` - Get specific bin status
 
-### Video Analysis
+### Analysis Operations
 
-- `POST /api/v1/analyze-video` - Analyze a video file from path
-- `POST /api/v1/analyze-upload` - **NEW!** Upload and analyze video/image file
+- `POST /api/v1/analyze-video` - Analyze a video file from server path
+- `POST /api/v1/analyze-upload` - Upload and analyze video/image file
+
+### Analysis History (NEW!)
+
+- `GET /api/v1/analyses` - List all analyses with pagination and filtering
+  - Query params: `skip`, `limit`, `status_filter`, `input_type_filter`, `sort_by`, `sort_order`
+- `GET /api/v1/analyses/{id}` - Get detailed analysis with bins and artifacts
+- `GET /api/v1/analyses/summary` - Get summary statistics for all analyses
+
+### Artifacts (NEW!)
+
+- `GET /api/v1/artifacts/{id}` - Download or view artifact file (overlay images, cropped bins, metadata)
 
 ### Utilities
 
 - `POST /api/v1/clear-cache` - Clear bin status cache
 
+**See full API documentation at:** http://localhost:8000/docs
+
 ## 🔧 Configuration
 
-Edit `ai/config.py` to customize:
+Configuration is managed through environment variables. Copy `.env.example` to `.env` and customize:
+
+```bash
+cp .env.example .env
+```
+
+### Database Configuration
+
+```bash
+# PostgreSQL (production - Docker)
+DATABASE_URL=postgresql://smart_waste_user:password@localhost:5432/smart_waste
+
+# SQLite (development - local)
+DATABASE_URL=sqlite:///./data/smart_waste.db
+```
+
+### Backend Settings
+
+```bash
+BACKEND_HOST=0.0.0.0
+BACKEND_PORT=8000
+MAX_UPLOAD_SIZE_MB=100
+STORE_UPLOADED_FILES=true
+DEBUG_MODE=false
+```
+
+### AI Configuration (ai/config.py)
 
 ### Detection Parameters
 
