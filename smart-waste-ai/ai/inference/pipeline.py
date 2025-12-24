@@ -13,6 +13,7 @@ This is the main entry point for the AI system.
 """
 
 import logging
+import json
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
@@ -76,6 +77,7 @@ class PipelineResult:
     bins: List[BinInstance]
     processing_time: float
     metadata: Dict = field(default_factory=dict)
+    debug_artifacts: Optional[Dict] = None
 
 
 class InferencePipeline:
@@ -116,7 +118,10 @@ class InferencePipeline:
         video_path: str,
         frame_skip: Optional[int] = None,
         max_frames: Optional[int] = None,
-        save_visualizations: bool = None
+        save_visualizations: bool = None,
+        debug: Optional[bool] = None,
+        debug_confidence_override: Optional[float] = None,
+        sampling_strategy: Optional[str] = None
     ) -> PipelineResult:
         """
         Process entire video and return bin status.
@@ -144,24 +149,53 @@ class InferencePipeline:
 
         logger.info(f"Processing video: {video_path.name}")
 
+        debug_enabled = debug if debug is not None else config.DEBUG_MODE
+        if debug_enabled:
+            logger.info("Debug mode enabled for this analysis")
+
+        confidence_override = debug_confidence_override
+        if confidence_override is None and config.DEBUG_CONFIDENCE_OVERRIDE is not None:
+            confidence_override = config.DEBUG_CONFIDENCE_OVERRIDE
+        if confidence_override is None and debug_enabled:
+            confidence_override = 0.15
+
+        sampling_strategy = sampling_strategy or config.VIDEO_SAMPLING_STRATEGY
         # Extract and process frames
-        frames = self._extract_frames(
+        frames, frame_info, frame_indices = self._extract_frames(
             video_path,
             frame_skip=frame_skip,
-            max_frames=max_frames
+            max_frames=max_frames,
+            sampling_strategy=sampling_strategy
         )
 
-        logger.info(f"Extracted {len(frames)} frames for processing")
+        logger.info(
+            "Extracted %s frames for processing (fps=%s, total_frames=%s, first_frame=%s)",
+            len(frames),
+            frame_info.get("fps"),
+            frame_info.get("total_frames"),
+            frame_info.get("first_frame_size")
+        )
 
         # Process each frame
         all_detections = []
-        for frame_idx, frame in enumerate(frames):
-            frame_detections = self._process_frame(frame, frame_idx)
+        analyzed_indices = []
+        for i, frame in enumerate(frames):
+            frame_idx = frame_indices[i]
+            frame_detections = self._process_frame(
+                frame,
+                frame_idx,
+                confidence_override=confidence_override,
+                log_detections=debug_enabled
+            )
             all_detections.append(frame_detections)
+            analyzed_indices.append(frame_idx)
 
             logger.debug(
                 f"Frame {frame_idx}: {len(frame_detections)} bins detected"
             )
+            if len(frame_detections) > 0:
+                logger.info("Early stop: bin detected, stopping frame processing")
+                break
 
         # Track bins across frames
         tracked_bins = self._track_bins_across_frames(all_detections)
@@ -176,6 +210,15 @@ class InferencePipeline:
         if save_visualizations or (save_visualizations is None and config.SAVE_VISUALIZATIONS):
             self._save_visualizations(frames, tracked_bins, video_path.stem)
 
+        debug_artifacts = None
+        if debug_enabled:
+            debug_artifacts = self._save_debug_frames(
+                frames[:len(analyzed_indices)],
+                analyzed_indices,
+                video_path.stem,
+                confidence_override=confidence_override
+            )
+
         processing_time = time.time() - start_time
 
         logger.info(
@@ -185,23 +228,31 @@ class InferencePipeline:
 
         return PipelineResult(
             video_path=str(video_path),
-            total_frames=len(frames),
-            processed_frames=len(frames),
+            total_frames=frame_info.get("total_frames") or len(frames),
+            processed_frames=len(analyzed_indices),
             bins=tracked_bins,
             processing_time=processing_time,
             metadata={
                 "detector": self.detector.get_model_info(),
                 "classifier": self.classifier.get_model_info(),
                 "frame_skip": frame_skip or "default",
+                "frame_info": frame_info,
+                "debug_confidence_override": confidence_override if debug_enabled else None,
+                "sampling_strategy": sampling_strategy,
+                "frame_indices": analyzed_indices,
+                "frames_analyzed": len(analyzed_indices),
             }
+            ,
+            debug_artifacts=debug_artifacts
         )
 
     def _extract_frames(
         self,
         video_path: Path,
         frame_skip: Optional[int] = None,
-        max_frames: Optional[int] = None
-    ) -> List[np.ndarray]:
+        max_frames: Optional[int] = None,
+        sampling_strategy: Optional[str] = None
+    ) -> Tuple[List[np.ndarray], Dict[str, Optional[object]], List[int]]:
         """
         Extract frames from video.
 
@@ -215,31 +266,61 @@ class InferencePipeline:
         """
         frame_skip = frame_skip or config.FRAME_EXTRACTION_RATE
         max_frames = max_frames or config.MAX_FRAMES_PER_VIDEO
+        sampling_strategy = sampling_strategy or config.VIDEO_SAMPLING_STRATEGY
 
         cap = cv2.VideoCapture(str(video_path))
         fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        skip_frames = int(fps * frame_skip)
-
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         frames = []
         frame_count = 0
+        first_frame_size = None
+        indices: List[int] = []
 
-        while cap.isOpened() and len(frames) < max_frames:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        if total_frames > 0 and sampling_strategy == "fixed_percentages":
+            percentages = [0.0, 0.2, 0.4, 0.6, 0.8, 0.95]
+            raw_indices = [int(p * (total_frames - 1)) for p in percentages]
+            indices = sorted(set(max(0, min(total_frames - 1, idx)) for idx in raw_indices))
+        elif total_frames > 0:
+            step = max(1, total_frames // max_frames)
+            indices = list(range(0, total_frames, step))[:max_frames]
 
-            if frame_count % skip_frames == 0:
+        if indices:
+            for idx in indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ret, frame = cap.read()
+                if not ret:
+                    continue
                 frames.append(frame)
-
-            frame_count += 1
+                if first_frame_size is None:
+                    first_frame_size = (frame.shape[1], frame.shape[0])
+            frame_count = len(indices)
+        else:
+            skip_frames = int(fps * frame_skip)
+            while cap.isOpened() and len(frames) < max_frames:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if frame_count % skip_frames == 0:
+                    frames.append(frame)
+                    indices.append(frame_count)
+                    if first_frame_size is None:
+                        first_frame_size = (frame.shape[1], frame.shape[0])
+                frame_count += 1
 
         cap.release()
-        return frames
+        return frames, {
+            "fps": int(fps),
+            "total_frames": total_frames,
+            "frames_read": frame_count,
+            "first_frame_size": first_frame_size
+        }, indices
 
     def _process_frame(
         self,
         frame: np.ndarray,
-        frame_idx: int
+        frame_idx: int,
+        confidence_override: Optional[float] = None,
+        log_detections: bool = False
     ) -> List[Tuple[Detection, ClassificationResult]]:
         """
         Process a single frame: detect and classify bins.
@@ -252,7 +333,11 @@ class InferencePipeline:
             List of (Detection, ClassificationResult) tuples
         """
         # Detect bins in frame
-        detections = self.detector.detect(frame)
+        detections = self.detector.detect(
+            frame,
+            confidence_threshold=confidence_override,
+            log_detections=log_detections
+        )
 
         results = []
         for detection in detections:
@@ -269,6 +354,84 @@ class InferencePipeline:
                 )
 
         return results
+
+    def _save_debug_frames(
+        self,
+        frames: List[np.ndarray],
+        frame_indices: List[int],
+        video_name: str,
+        confidence_override: Optional[float] = None
+    ) -> Optional[Dict]:
+        if not frames:
+            return None
+
+        debug_dir = config.DEBUG_OUTPUT_DIR
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
+        indices = list(range(len(frames)))
+
+        artifacts = {
+            "frames": [],
+            "annotated": [],
+            "metadata": None
+        }
+
+        metadata = {
+            "video_name": video_name,
+            "frame_indices": frame_indices,
+            "confidence_override": confidence_override,
+            "detections": []
+        }
+
+        for i, frame in enumerate(frames):
+            frame_number = frame_indices[i] if i < len(frame_indices) else i
+            frame_path = debug_dir / f"{video_name}_frame_{frame_number}.jpg"
+            cv2.imwrite(str(frame_path), frame)
+            artifacts["frames"].append(str(frame_path))
+
+            if hasattr(self.detector, "detect_raw"):
+                raw_detections = self.detector.detect_raw(
+                    frame,
+                    confidence_threshold=confidence_override
+                )
+            else:
+                raw_detections = self.detector.detect(
+                    frame,
+                    confidence_threshold=confidence_override
+                )
+
+            annotated = self.detector.visualize_detections(frame, raw_detections)
+            annotated_path = debug_dir / f"{video_name}_frame_{frame_number}_annotated.jpg"
+            cv2.imwrite(str(annotated_path), annotated)
+            artifacts["annotated"].append(str(annotated_path))
+
+            metadata["detections"].append({
+                "frame_index": frame_number,
+                "count": len(raw_detections),
+                "items": [
+                    {
+                        "class_id": det.class_id,
+                        "class_name": det.class_name,
+                        "confidence": float(det.confidence),
+                        "bbox": det.bbox
+                    }
+                    for det in raw_detections
+                ]
+            })
+
+        metadata_path = debug_dir / f"{video_name}_debug_metadata.json"
+        with open(metadata_path, "w") as metadata_file:
+            json.dump(metadata, metadata_file, indent=2)
+        artifacts["metadata"] = str(metadata_path)
+
+        logger.info(
+            "Debug artifacts saved: frames=%s annotated=%s metadata=%s",
+            len(artifacts["frames"]),
+            len(artifacts["annotated"]),
+            metadata_path
+        )
+
+        return artifacts
 
     def _track_bins_across_frames(
         self,

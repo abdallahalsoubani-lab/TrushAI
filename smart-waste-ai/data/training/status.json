@@ -1,0 +1,21 @@
+{
+  "state": "failed",
+  "epoch": 0,
+  "epochs": 50,
+  "metrics": {},
+  "logs_tail": "",
+  "artifacts": {
+    "run_dir": "\u001b[1m/Users/soubani/Desktop/TrushAI/smart-waste-ai/data/training/runs/trashbin-train\u001b[0m",
+    "best_pt": null,
+    "last_pt": null,
+    "results_png": null,
+    "confusion_matrix_png": null,
+    "metrics_json": null,
+    "results_csv": null
+  },
+  "error": "Training completed but best.pt was not found.",
+  "project_name": "trashbin-train",
+  "device": "mps",
+  "dataset_yaml": "/Users/soubani/Desktop/TrushAI/smart-waste-ai/data/training/dataset/dataset.yaml",
+  "run_dir": "\u001b[1m/Users/soubani/Desktop/TrushAI/smart-waste-ai/data/training/runs/trashbin-train\u001b[0m"
+}

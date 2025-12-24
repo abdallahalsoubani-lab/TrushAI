@@ -144,6 +144,12 @@ export default function Home() {
               >
                 Upload File
               </Link>
+              <Link
+                href="/train"
+                className="px-4 py-2 bg-gray-800 text-white rounded-lg hover:bg-gray-900 transition"
+              >
+                Train Model
+              </Link>
               <label className="flex items-center gap-2 text-sm">
                 <input
                   type="checkbox"

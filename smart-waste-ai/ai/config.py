@@ -38,6 +38,10 @@ class Config:
     # Smaller models are faster but less accurate
     YOLO_MODEL_SIZE: str = "n"  # Using nano for fast MVP inference
 
+    # Custom weights path (default: yolov8n.pt)
+    # If not provided and bins.pt exists in project root, use it automatically.
+    YOLO_WEIGHTS_PATH: str = os.getenv("YOLO_WEIGHTS_PATH", "").strip()
+
     # Confidence threshold for detections (0.0 - 1.0)
     # Lower = more detections (higher recall, lower precision)
     # Higher = fewer detections (lower recall, higher precision)
@@ -68,7 +72,8 @@ class Config:
     # - For demo purposes, we'll also consider 'suitcase' (28) as bins
     # TODO: Fine-tune YOLO on custom trash bin dataset
     # TODO: Add custom trash bin class
-    TRASH_BIN_CLASSES: list = [28]  # Using 'suitcase' as proxy for bins in MVP
+    # For custom training: use class name "trash_container"
+    TRASH_BIN_CLASSES: list = ["trash_container"]
 
     # Alternative: Use all objects and filter by aspect ratio/size
     DETECT_ALL_OBJECTS: bool = True  # If True, ignore TRASH_BIN_CLASSES
@@ -114,7 +119,10 @@ class Config:
     FRAME_EXTRACTION_RATE: int = 2  # seconds
 
     # Maximum frames to process per video (for MVP performance)
-    MAX_FRAMES_PER_VIDEO: int = 50
+    MAX_FRAMES_PER_VIDEO: int = 12
+
+    # Sampling strategy: "fixed_percentages" or "every_n"
+    VIDEO_SAMPLING_STRATEGY: str = os.getenv("VIDEO_SAMPLING_STRATEGY", "fixed_percentages")
 
     # Frame format for saving
     FRAME_FORMAT: str = "jpg"
@@ -159,6 +167,22 @@ class Config:
 
     # Enable debug mode to save detailed artifacts for analysis
     DEBUG_MODE: bool = os.getenv("DEBUG_MODE", "False").lower() == "true"
+
+    # Debug logging for raw detections (pre-filter)
+    DEBUG_LOG_DETECTIONS: bool = os.getenv("DEBUG_LOG_DETECTIONS", "False").lower() == "true"
+    DEBUG_DETECTIONS_LIMIT: int = int(os.getenv("DEBUG_DETECTIONS_LIMIT", "10"))
+
+    # Optional confidence override for debug runs (e.g., 0.15)
+    DEBUG_CONFIDENCE_OVERRIDE = None
+    _debug_conf_raw = os.getenv("DEBUG_CONFIDENCE_OVERRIDE", "").strip()
+    if _debug_conf_raw:
+        try:
+            DEBUG_CONFIDENCE_OVERRIDE = float(_debug_conf_raw)
+        except ValueError:
+            DEBUG_CONFIDENCE_OVERRIDE = None
+
+    # Number of random frames to save for debug artifacts
+    DEBUG_SAVE_FRAME_COUNT: int = int(os.getenv("DEBUG_SAVE_FRAME_COUNT", "3"))
 
     # Directory for debug artifacts
     DEBUG_OUTPUT_DIR = RESULTS_DIR / "debug"
@@ -208,6 +232,29 @@ class Config:
             str: Model name like 'yolov8n.pt'
         """
         return f"yolov8{cls.YOLO_MODEL_SIZE}.pt"
+
+    @classmethod
+    def get_yolo_weights_path(cls) -> str:
+        """
+        Resolve YOLO weights path.
+
+        Priority:
+        1) YOLO_WEIGHTS_PATH env override
+        2) bins.pt in project root (post-training)
+        3) default Ultralytics model name (e.g., yolov8n.pt)
+        """
+        if cls.YOLO_WEIGHTS_PATH:
+            return cls.YOLO_WEIGHTS_PATH
+
+        backend_bins = cls.PROJECT_ROOT / "backend" / "weights" / "bins.pt"
+        if backend_bins.exists():
+            return str(backend_bins)
+
+        bins_path = cls.PROJECT_ROOT / "bins.pt"
+        if bins_path.exists():
+            return str(bins_path)
+
+        return cls.get_yolo_model_name()
 
     @classmethod
     def to_dict(cls) -> Dict[str, Any]:

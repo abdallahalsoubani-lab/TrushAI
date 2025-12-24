@@ -16,6 +16,7 @@ TODO: Add model ensembling (multiple YOLO models)
 """
 
 import logging
+from pathlib import Path
 from typing import List, Optional
 import numpy as np
 
@@ -72,11 +73,22 @@ class YOLOv8Detector(DetectorInterface):
         try:
             from ultralytics import YOLO
 
-            model_name = f"yolov8{self.model_size}.pt"
-            logger.info(f"Loading YOLO model: {model_name}")
+            weights_path = config.get_yolo_weights_path()
+            logger.info(f"Loading YOLO model: {weights_path}")
+
+            default_weights = {
+                "yolov8n.pt",
+                "yolov8s.pt",
+                "yolov8m.pt",
+                "yolov8l.pt",
+                "yolov8x.pt",
+            }
+            if Path(weights_path).name not in default_weights:
+                config.DETECT_ALL_OBJECTS = False
+                config.TRASH_BIN_CLASSES = ["trash_container"]
 
             # Load model (downloads weights if not cached)
-            self.model = YOLO(model_name)
+            self.model = YOLO(weights_path)
 
             # Move to specified device
             self.model.to(self.device)
@@ -87,6 +99,8 @@ class YOLOv8Detector(DetectorInterface):
             logger.info(f"✓ YOLO model loaded successfully")
             logger.info(f"  Device: {self.device}")
             logger.info(f"  Classes: {len(self.class_names)}")
+            logger.info(f"  Weights: {weights_path}")
+            logger.info(f"  Class names: {list(self.class_names.values())}")
 
         except ImportError:
             logger.error("Ultralytics package not installed. Run: pip install ultralytics")
@@ -99,7 +113,8 @@ class YOLOv8Detector(DetectorInterface):
     def detect(
         self,
         image: np.ndarray,
-        confidence_threshold: Optional[float] = None
+        confidence_threshold: Optional[float] = None,
+        log_detections: bool = False
     ) -> List[Detection]:
         """
         Detect objects in image using YOLOv8.
@@ -115,41 +130,41 @@ class YOLOv8Detector(DetectorInterface):
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
         conf_thresh = confidence_threshold or self.confidence_threshold
+        log_enabled = log_detections or config.DEBUG_LOG_DETECTIONS
+
+        if confidence_threshold is None and config.DEBUG_CONFIDENCE_OVERRIDE is not None:
+            conf_thresh = config.DEBUG_CONFIDENCE_OVERRIDE
+            if log_enabled:
+                logger.info(
+                    f"Debug override: confidence_threshold={conf_thresh}"
+                )
 
         try:
-            # Run YOLO inference
-            # verbose=False suppresses per-image logging
-            results = self.model.predict(
-                image,
-                conf=conf_thresh,
-                iou=config.YOLO_IOU_THRESHOLD,
-                max_det=config.YOLO_MAX_DETECTIONS,
-                imgsz=config.YOLO_IMAGE_SIZE,
-                verbose=False,
-                device=self.device
-            )
+            if log_enabled:
+                logger.info(
+                    "YOLO input: shape=%s dtype=%s (OpenCV BGR), imgsz=%s conf=%.2f iou=%.2f max_det=%s",
+                    image.shape,
+                    image.dtype,
+                    config.YOLO_IMAGE_SIZE,
+                    conf_thresh,
+                    config.YOLO_IOU_THRESHOLD,
+                    config.YOLO_MAX_DETECTIONS
+                )
 
-            # Extract detections from results
-            detections = []
-            result = results[0]  # Single image inference
+            detections = self._run_yolo(image, conf_thresh)
 
-            if result.boxes is not None and len(result.boxes) > 0:
-                boxes = result.boxes.xyxy.cpu().numpy()  # Bounding boxes
-                confidences = result.boxes.conf.cpu().numpy()  # Confidence scores
-                class_ids = result.boxes.cls.cpu().numpy().astype(int)  # Class IDs
-
-                for box, conf, class_id in zip(boxes, confidences, class_ids):
-                    x1, y1, x2, y2 = map(int, box)
-
-                    detection = Detection(
-                        bbox=(x1, y1, x2, y2),
-                        confidence=float(conf),
-                        class_id=int(class_id),
-                        class_name=self.class_names[class_id],
-                        image_shape=image.shape
-                    )
-
-                    detections.append(detection)
+            if log_enabled:
+                if detections:
+                    for det in detections[:config.DEBUG_DETECTIONS_LIMIT]:
+                        logger.info(
+                            "Raw detection: class_id=%s class_name=%s conf=%.3f bbox=%s",
+                            det.class_id,
+                            det.class_name,
+                            det.confidence,
+                            det.bbox
+                        )
+                else:
+                    logger.info("Raw detection: 0 objects")
 
             # Filter detections for trash bins
             bin_detections = self._filter_for_bins(detections)
@@ -164,6 +179,85 @@ class YOLOv8Detector(DetectorInterface):
         except Exception as e:
             logger.error(f"Detection failed: {e}")
             raise
+
+    def detect_raw(
+        self,
+        image: np.ndarray,
+        confidence_threshold: Optional[float] = None,
+        log_detections: bool = False
+    ) -> List[Detection]:
+        """
+        Run YOLO detection without any bin filtering.
+        """
+        if not self.is_loaded():
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+
+        conf_thresh = confidence_threshold or self.confidence_threshold
+        log_enabled = log_detections or config.DEBUG_LOG_DETECTIONS
+
+        if confidence_threshold is None and config.DEBUG_CONFIDENCE_OVERRIDE is not None:
+            conf_thresh = config.DEBUG_CONFIDENCE_OVERRIDE
+            if log_enabled:
+                logger.info(
+                    f"Debug override: confidence_threshold={conf_thresh}"
+                )
+
+        try:
+            if log_enabled:
+                logger.info(
+                    "YOLO raw input: shape=%s dtype=%s (OpenCV BGR), imgsz=%s conf=%.2f iou=%.2f max_det=%s",
+                    image.shape,
+                    image.dtype,
+                    config.YOLO_IMAGE_SIZE,
+                    conf_thresh,
+                    config.YOLO_IOU_THRESHOLD,
+                    config.YOLO_MAX_DETECTIONS
+                )
+
+            return self._run_yolo(image, conf_thresh)
+        except Exception as e:
+            logger.error(f"Raw detection failed: {e}")
+            raise
+
+    def _run_yolo(
+        self,
+        image: np.ndarray,
+        conf_thresh: float
+    ) -> List[Detection]:
+        # Run YOLO inference
+        # verbose=False suppresses per-image logging
+        results = self.model.predict(
+            image,
+            conf=conf_thresh,
+            iou=config.YOLO_IOU_THRESHOLD,
+            max_det=config.YOLO_MAX_DETECTIONS,
+            imgsz=config.YOLO_IMAGE_SIZE,
+            verbose=False,
+            device=self.device
+        )
+
+        detections = []
+        result = results[0]  # Single image inference
+
+        if result.boxes is not None and len(result.boxes) > 0:
+            boxes = result.boxes.xyxy.cpu().numpy()  # Bounding boxes
+            confidences = result.boxes.conf.cpu().numpy()  # Confidence scores
+            class_ids = result.boxes.cls.cpu().numpy().astype(int)  # Class IDs
+
+            for box, conf, class_id in zip(boxes, confidences, class_ids):
+                x1, y1, x2, y2 = map(int, box)
+
+                detection = Detection(
+                    bbox=(x1, y1, x2, y2),
+                    confidence=float(conf),
+                    class_id=int(class_id),
+                    class_name=self.class_names[class_id],
+                    image_shape=image.shape
+                )
+
+                detections.append(detection)
+
+        return detections
 
     def _filter_for_bins(self, detections: List[Detection]) -> List[Detection]:
         """
@@ -180,10 +274,30 @@ class YOLOv8Detector(DetectorInterface):
             Filtered list containing only bin detections
         """
         if not config.DETECT_ALL_OBJECTS:
-            # Filter by specific trash bin classes
+            # Filter by specific trash bin classes (IDs or class names)
+            allowed_ids = set()
+            allowed_names = set()
+
+            for cls in config.TRASH_BIN_CLASSES:
+                if isinstance(cls, int):
+                    allowed_ids.add(cls)
+                else:
+                    allowed_names.add(str(cls).strip().lower())
+
+            if allowed_names and self.class_names:
+                for class_id, class_name in self.class_names.items():
+                    if str(class_name).strip().lower() in allowed_names:
+                        allowed_ids.add(int(class_id))
+
+            if not allowed_ids and allowed_names:
+                logger.warning(
+                    "No matching class IDs found for names: %s",
+                    sorted(allowed_names)
+                )
+
             return [
                 det for det in detections
-                if det.class_id in config.TRASH_BIN_CLASSES
+                if det.class_id in allowed_ids
             ]
         else:
             # Filter by geometric properties
@@ -216,11 +330,13 @@ class YOLOv8Detector(DetectorInterface):
             "name": f"YOLOv8{self.model_size}",
             "version": "8",
             "framework": "Ultralytics",
+            "backend": "ultralytics.YOLO",
             "classes": list(self.class_names.values()) if self.class_names else [],
             "num_classes": len(self.class_names) if self.class_names else 0,
             "input_size": config.YOLO_IMAGE_SIZE,
             "device": self.device,
             "confidence_threshold": self.confidence_threshold,
+            "weights": config.get_yolo_weights_path(),
         }
 
     def detect_and_crop_bins(

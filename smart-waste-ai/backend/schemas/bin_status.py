@@ -135,6 +135,10 @@ class VideoAnalysisRequest(BaseModel):
         None,
         description="Whether to save result visualizations"
     )
+    debug: Optional[bool] = Field(
+        None,
+        description="Enable debug artifacts and extra logging for this request"
+    )
 
     @validator('video_path')
     def validate_video_path(cls, v):
@@ -150,7 +154,8 @@ class VideoAnalysisRequest(BaseModel):
                 "video_path": "/path/to/video.mp4",
                 "frame_skip": 2,
                 "max_frames": 50,
-                "save_visualizations": True
+                "save_visualizations": True,
+                "debug": False
             }
         }
 
@@ -172,6 +177,13 @@ class VideoAnalysisResponse(BaseModel):
     metadata: Dict[str, Any] = Field(
         default_factory=dict,
         description="Additional processing metadata"
+    )
+    frames_analyzed: int = Field(..., description="Number of frames analyzed")
+    frame_indices: list[int] = Field(default_factory=list, description="Frame indices analyzed")
+    sampling_strategy: str = Field(..., description="Frame sampling strategy used")
+    debug_artifacts: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Debug artifacts (only when debug enabled): frames, annotated, metadata"
     )
 
     class Config:
@@ -280,6 +292,18 @@ class UploadAnalysisResponse(BaseModel):
     debug_artifacts: Optional[Dict[str, Any]] = Field(
         None,
         description="Debug artifacts (only when DEBUG_MODE enabled): overlay image, cropped bins, metadata"
+    )
+    frames_analyzed: Optional[int] = Field(
+        None,
+        description="Number of frames analyzed (video only)"
+    )
+    frame_indices: Optional[list[int]] = Field(
+        None,
+        description="Frame indices analyzed (video only)"
+    )
+    sampling_strategy: Optional[str] = Field(
+        None,
+        description="Sampling strategy used (video only)"
     )
 
     class Config:

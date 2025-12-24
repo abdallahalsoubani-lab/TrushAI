@@ -119,7 +119,8 @@ class DetectorInterface(ABC):
     def detect(
         self,
         image: np.ndarray,
-        confidence_threshold: Optional[float] = None
+        confidence_threshold: Optional[float] = None,
+        log_detections: bool = False
     ) -> List[Detection]:
         """
         Detect objects in an image.
@@ -127,6 +128,7 @@ class DetectorInterface(ABC):
         Args:
             image: Input image as numpy array (H, W, C) in BGR format
             confidence_threshold: Optional confidence threshold override
+            log_detections: Whether to log raw detections (pre-filter)
 
         Returns:
             List of Detection objects, sorted by confidence (descending)

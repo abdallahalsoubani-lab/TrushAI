@@ -85,7 +85,8 @@ class InferenceService:
         video_path: str,
         frame_skip: Optional[int] = None,
         max_frames: Optional[int] = None,
-        save_visualizations: Optional[bool] = None
+        save_visualizations: Optional[bool] = None,
+        debug: Optional[bool] = None
     ) -> VideoAnalysisResponse:
         """
         Analyze a video and detect trash bins with fill levels.
@@ -123,7 +124,8 @@ class InferenceService:
                 video_path=video_path,
                 frame_skip=frame_skip,
                 max_frames=max_frames,
-                save_visualizations=save_visualizations
+                save_visualizations=save_visualizations,
+                debug=debug
             )
 
             # Convert bin instances to API response format
@@ -144,16 +146,38 @@ class InferenceService:
             )
 
             # Build response
+            metadata = result.metadata or {}
+            detections = metadata.get("detections", [])
+            detected_total = 0
+            if isinstance(detections, list):
+                detected_total = sum(d.get("count", 0) for d in detections if isinstance(d, dict))
+
+            metadata["detections_summary"] = [
+                {"frame_index": d.get("frame_index"), "count": d.get("count", 0)}
+                for d in detections
+                if isinstance(d, dict)
+            ]
+
+            bins_detected = max(len(bin_responses), detected_total)
+            print(
+                "[analyze_video] bins_detected=%s len(bin_responses)=%s detected_total=%s frame_indices=%s"
+                % (bins_detected, len(bin_responses), detected_total, metadata.get("frame_indices"))
+            )
+
             response = VideoAnalysisResponse(
                 job_id=job_id,
                 status="completed",
                 video_path=result.video_path,
                 total_frames=result.total_frames,
                 processed_frames=result.processed_frames,
-                bins_detected=len(bin_responses),
+                bins_detected=bins_detected,
                 bins=bin_responses,
                 processing_time=result.processing_time,
-                metadata=result.metadata
+                metadata=metadata,
+                debug_artifacts=result.debug_artifacts,
+                frames_analyzed=result.metadata.get("frames_analyzed", result.processed_frames),
+                frame_indices=result.metadata.get("frame_indices", []),
+                sampling_strategy=result.metadata.get("sampling_strategy", "fixed_percentages"),
             )
 
             return response
@@ -216,6 +240,9 @@ class InferenceService:
             "last_analysis": self.last_analysis_time.isoformat() if self.last_analysis_time else None,
             "detector_info": self.pipeline.detector.get_model_info() if self.pipeline else None,
             "classifier_info": self.pipeline.classifier.get_model_info() if self.pipeline else None,
+            "detector_weights": self.pipeline.detector.get_model_info().get("weights") if self.pipeline else None,
+            "detector_classes": self.pipeline.detector.get_model_info().get("classes") if self.pipeline else None,
+            "detector_backend": self.pipeline.detector.get_model_info().get("backend") if self.pipeline else None,
         }
 
     def _bin_instance_to_response(

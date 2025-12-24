@@ -18,8 +18,8 @@ import shutil
 import json
 import uuid
 from datetime import datetime
-from typing import Optional, List
-from fastapi import APIRouter, HTTPException, status, UploadFile, File, Depends, Query
+from typing import Optional, List, Dict
+from fastapi import APIRouter, HTTPException, status, UploadFile, File, Depends, Query, Form
 from fastapi.responses import FileResponse
 from pathlib import Path
 from sqlalchemy.orm import Session
@@ -34,10 +34,12 @@ from backend.schemas.bin_status import (
     UploadAnalysisResponse
 )
 from backend.services.inference_service import get_inference_service
+from backend.services import training_service
 from backend.database.session import get_db, check_db_connection
 from backend.services.analysis_service import AnalysisService
 from backend.config import config as backend_config
 from ai.config import config
+from pydantic import BaseModel
 
 # Set up logging
 logging.basicConfig(
@@ -48,6 +50,28 @@ logger = logging.getLogger(__name__)
 
 # Create router
 router = APIRouter()
+
+
+class AnnotationRequest(BaseModel):
+    filename: str
+    bbox: Dict[str, float]
+
+
+class PrepareDatasetRequest(BaseModel):
+    train_ratio: float = 0.8
+
+
+class TrainStartRequest(BaseModel):
+    model_size: str = "n"
+    epochs: int = 50
+    imgsz: int = 640
+    batch: int = 8
+    device: str = "auto"
+    project_name: str = "trashbin-train"
+
+
+class UseModelRequest(BaseModel):
+    weights_path: str
 
 
 @router.get(
@@ -244,7 +268,8 @@ async def analyze_video(request: VideoAnalysisRequest):
             video_path=request.video_path,
             frame_skip=request.frame_skip,
             max_frames=request.max_frames,
-            save_visualizations=request.save_visualizations
+            save_visualizations=request.save_visualizations,
+            debug=request.debug
         )
 
         logger.info(
@@ -334,7 +359,10 @@ async def clear_cache():
         }
     }
 )
-async def analyze_upload(file: UploadFile = File(...)):
+async def analyze_upload(
+    file: UploadFile = File(...),
+    debug: bool = Form(False)
+):
     """
     Upload and analyze a video or image file.
 
@@ -400,6 +428,8 @@ async def analyze_upload(file: UploadFile = File(...)):
 
         logger.info(f"API: Saved upload to: {temp_file_path}")
 
+        debug_enabled = debug or config.DEBUG_MODE
+
         # Process based on file type
         if input_type == "video":
             # Use existing video analysis pipeline
@@ -408,17 +438,36 @@ async def analyze_upload(file: UploadFile = File(...)):
                 video_path=temp_file_path,
                 frame_skip=3,  # Process every 3 seconds for faster results
                 max_frames=30,  # Limit frames for quick analysis
-                save_visualizations=False  # Don't save visualizations for uploads
+                save_visualizations=False,  # Don't save visualizations for uploads
+                debug=debug_enabled
+            )
+
+            metadata = result.metadata or {}
+            detections = metadata.get("detections", [])
+            detected_total = 0
+            if isinstance(detections, list):
+                detected_total = sum(
+                    d.get("count", 0) for d in detections if isinstance(d, dict)
+                )
+            effective_bins_detected = max(result.bins_detected or 0, detected_total)
+            print(
+                f"[analyze-upload] effective={effective_bins_detected} "
+                f"orig={result.bins_detected} detected_total={detected_total} "
+                f"frame_indices={metadata.get('frame_indices')}"
             )
 
             # Check if any bins were detected
-            if result.bins_detected == 0:
+            if effective_bins_detected == 0:
                 return UploadAnalysisResponse(
                     input_type=input_type,
                     status="NO_BIN_DETECTED",
                     confidence=0.0,
                     bins_detected=0,
-                    message="No bins detected in video"
+                    message="No bins detected in video",
+                    debug_artifacts=result.debug_artifacts if debug_enabled else None,
+                    frames_analyzed=result.metadata.get("frames_analyzed"),
+                    frame_indices=result.metadata.get("frame_indices"),
+                    sampling_strategy=result.metadata.get("sampling_strategy"),
                 )
 
             # Aggregate results to get overall status
@@ -451,8 +500,12 @@ async def analyze_upload(file: UploadFile = File(...)):
                 input_type=input_type,
                 status=overall_status,
                 confidence=round(avg_confidence, 2),
-                bins_detected=result.bins_detected,
-                message="Video analysis complete"
+                bins_detected=effective_bins_detected,
+                message="Video analysis complete",
+                debug_artifacts=result.debug_artifacts if debug_enabled else None,
+                frames_analyzed=result.metadata.get("frames_analyzed"),
+                frame_indices=result.metadata.get("frame_indices"),
+                sampling_strategy=result.metadata.get("sampling_strategy"),
             )
 
         else:  # image
@@ -498,9 +551,9 @@ async def analyze_upload(file: UploadFile = File(...)):
                 f"status: {fullest.fill_level.value}, confidence: {fullest.confidence:.2f}"
             )
 
-            # Generate debug artifacts if DEBUG_MODE is enabled
+            # Generate debug artifacts if debug is enabled
             debug_artifacts = None
-            if config.DEBUG_MODE:
+            if debug_enabled:
                 import json
                 import uuid
                 from datetime import datetime
@@ -617,6 +670,282 @@ async def analyze_upload(file: UploadFile = File(...)):
                 logger.info(f"API: Cleaned up temp file: {temp_file_path}")
             except Exception as e:
                 logger.warning(f"Failed to delete temp file: {e}")
+
+
+@router.post(
+    "/dataset/upload",
+    summary="Upload Training Images",
+    description="Upload multiple images for training dataset"
+)
+async def dataset_upload(images: List[UploadFile] = File(...)):
+    saved_files = []
+    backend_config.TRAINING_IMAGES_RAW.mkdir(parents=True, exist_ok=True)
+
+    for image in images:
+        filename = image.filename or "image.jpg"
+        suffix = Path(filename).suffix.lower()
+        if suffix not in backend_config.ALLOWED_IMAGE_EXTENSIONS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid image format: {suffix}"
+            )
+
+        target_path = backend_config.TRAINING_IMAGES_RAW / filename
+        if target_path.exists():
+            target_path = backend_config.TRAINING_IMAGES_RAW / f"{target_path.stem}_{uuid.uuid4().hex[:6]}{suffix}"
+
+        with open(target_path, "wb") as f:
+            shutil.copyfileobj(image.file, f)
+
+        saved_files.append({"filename": target_path.name, "path": str(target_path)})
+
+    return {"files": saved_files}
+
+
+@router.get(
+    "/dataset/list",
+    summary="List Training Images",
+    description="List uploaded images and annotation status"
+)
+async def dataset_list():
+    images = []
+    backend_config.TRAINING_IMAGES_RAW.mkdir(parents=True, exist_ok=True)
+    backend_config.TRAINING_LABELS_RAW.mkdir(parents=True, exist_ok=True)
+
+    for image_path in sorted(backend_config.TRAINING_IMAGES_RAW.iterdir()):
+        if image_path.suffix.lower() not in backend_config.ALLOWED_IMAGE_EXTENSIONS:
+            continue
+        label_path = backend_config.TRAINING_LABELS_RAW / f"{image_path.stem}.txt"
+        annotated = label_path.exists() and label_path.stat().st_size > 0
+        images.append({
+            "filename": image_path.name,
+            "path": str(image_path),
+            "annotated": annotated
+        })
+
+    return {"images": images}
+
+
+@router.get(
+    "/dataset/image/{filename}",
+    summary="Get Training Image",
+    description="Serve a training image by filename"
+)
+async def dataset_image(filename: str):
+    image_path = backend_config.TRAINING_IMAGES_RAW / filename
+    if not image_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Image not found"
+        )
+    return FileResponse(str(image_path))
+
+
+@router.post(
+    "/dataset/annotate",
+    summary="Save Annotation",
+    description="Save YOLO annotation for a single image"
+)
+async def dataset_annotate(request: AnnotationRequest):
+    image_path = backend_config.TRAINING_IMAGES_RAW / request.filename
+    if not image_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Image not found"
+        )
+
+    bbox = request.bbox
+    for key in ["x", "y", "w", "h"]:
+        if key not in bbox:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Missing bbox field: {key}"
+            )
+        if not (0.0 <= bbox[key] <= 1.0):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid bbox value for {key}"
+            )
+
+    backend_config.TRAINING_LABELS_RAW.mkdir(parents=True, exist_ok=True)
+    label_path = backend_config.TRAINING_LABELS_RAW / f"{image_path.stem}.txt"
+    with open(label_path, "w") as f:
+        f.write(f"0 {bbox['x']} {bbox['y']} {bbox['w']} {bbox['h']}\n")
+
+    return {"status": "saved", "label": str(label_path)}
+
+
+@router.post(
+    "/dataset/prepare",
+    summary="Prepare Dataset",
+    description="Split train/val and build dataset.yaml"
+)
+async def dataset_prepare(request: PrepareDatasetRequest):
+    import random
+
+    train_ratio = request.train_ratio
+    if not (0.5 <= train_ratio <= 0.95):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="train_ratio must be between 0.5 and 0.95"
+        )
+
+    images = []
+    for p in backend_config.TRAINING_IMAGES_RAW.iterdir():
+        if p.suffix.lower() not in backend_config.ALLOWED_IMAGE_EXTENSIONS:
+            continue
+        label_path = backend_config.TRAINING_LABELS_RAW / f"{p.stem}.txt"
+        if not label_path.exists():
+            continue
+        images.append(p)
+    if not images:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No annotated images. Annotate first."
+        )
+    if not images:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No images found to prepare dataset"
+        )
+
+    random.shuffle(images)
+    split_idx = int(len(images) * train_ratio)
+    train_images = images[:split_idx]
+    val_images = images[split_idx:]
+
+    dataset_dir = backend_config.TRAINING_DATASET_DIR
+    if dataset_dir.exists():
+        shutil.rmtree(dataset_dir)
+    (dataset_dir / "images" / "train").mkdir(parents=True, exist_ok=True)
+    (dataset_dir / "images" / "val").mkdir(parents=True, exist_ok=True)
+    (dataset_dir / "labels" / "train").mkdir(parents=True, exist_ok=True)
+    (dataset_dir / "labels" / "val").mkdir(parents=True, exist_ok=True)
+
+    for image_path in train_images:
+        label_path = backend_config.TRAINING_LABELS_RAW / f"{image_path.stem}.txt"
+        if not label_path.exists():
+            continue
+        shutil.copy2(image_path, dataset_dir / "images" / "train" / image_path.name)
+        shutil.copy2(label_path, dataset_dir / "labels" / "train" / label_path.name)
+
+    for image_path in val_images:
+        label_path = backend_config.TRAINING_LABELS_RAW / f"{image_path.stem}.txt"
+        if not label_path.exists():
+            continue
+        shutil.copy2(image_path, dataset_dir / "images" / "val" / image_path.name)
+        shutil.copy2(label_path, dataset_dir / "labels" / "val" / label_path.name)
+
+    dataset_yaml = dataset_dir / "dataset.yaml"
+    with open(dataset_yaml, "w") as f:
+        f.write(f"path: {dataset_dir}\n")
+        f.write("train: images/train\n")
+        f.write("val: images/val\n")
+        f.write("names:\n")
+        f.write("  0: trash_container\n")
+
+    return {
+        "ok": True,
+        "trainCount": len(train_images),
+        "valCount": len(val_images),
+        "datasetYamlPath": str(dataset_yaml)
+    }
+
+
+@router.post(
+    "/train/start",
+    summary="Start Training",
+    description="Start YOLOv8 training in background"
+)
+async def train_start(request: TrainStartRequest):
+    dataset_yaml = backend_config.TRAINING_DATASET_DIR / "dataset.yaml"
+    if not dataset_yaml.exists():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="dataset.yaml not found. Run /dataset/prepare first."
+        )
+
+    result = training_service.start_training(
+        model_size=request.model_size,
+        epochs=request.epochs,
+        imgsz=request.imgsz,
+        batch=request.batch,
+        device=request.device,
+        project_name=request.project_name,
+        dataset_yaml=dataset_yaml,
+    )
+    if result.get("error"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=result["error"]
+        )
+    return result
+
+
+@router.get(
+    "/train/status",
+    summary="Training Status",
+    description="Get current training status and logs"
+)
+async def train_status():
+    return training_service.get_status()
+
+
+@router.get(
+    "/train/artifacts",
+    summary="Training Artifacts",
+    description="Get paths to training artifacts"
+)
+async def train_artifacts():
+    status = training_service.get_status()
+    artifacts = status.get("artifacts", {})
+    base_url = "/api/v1/train/download"
+    downloads = {
+        "best_pt": f"{base_url}/best" if artifacts.get("best_pt") else None,
+        "results_png": f"{base_url}/results" if artifacts.get("results_png") else None,
+        "confusion_matrix_png": f"{base_url}/confusion" if artifacts.get("confusion_matrix_png") else None,
+        "metrics_json": f"{base_url}/metrics" if artifacts.get("metrics_json") else None,
+    }
+    return {"artifacts": artifacts, "downloads": downloads}
+
+
+@router.get(
+    "/train/download/{artifact}",
+    summary="Download Training Artifact",
+    description="Download artifacts like best.pt or results.png"
+)
+async def train_download_artifact(artifact: str):
+    status = training_service.get_status()
+    artifacts = status.get("artifacts", {})
+
+    mapping = {
+        "best": artifacts.get("best_pt"),
+        "results": artifacts.get("results_png"),
+        "confusion": artifacts.get("confusion_matrix_png"),
+        "metrics": artifacts.get("metrics_json"),
+    }
+    target = mapping.get(artifact)
+    if not target:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Artifact not found"
+        )
+    return FileResponse(target)
+
+
+@router.post(
+    "/train/use-model",
+    summary="Use Trained Model",
+    description="Activate trained weights for inference"
+)
+async def train_use_model(request: UseModelRequest):
+    result = training_service.use_model(request.weights_path)
+    if result.get("error"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=result["error"]
+        )
+    return result
 
 
 @router.get(

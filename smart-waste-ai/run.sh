@@ -19,19 +19,19 @@ NC='\033[0m' # No Color
 
 # Function to print colored messages
 print_info() {
-    echo -e "${BLUE}9 ${1}${NC}"
+    echo -e "${BLUE}[INFO] ${1}${NC}"
 }
 
 print_success() {
-    echo -e "${GREEN} ${1}${NC}"
+    echo -e "${GREEN}[OK] ${1}${NC}"
 }
 
 print_warning() {
-    echo -e "${YELLOW}  ${1}${NC}"
+    echo -e "${YELLOW}[WARN] ${1}${NC}"
 }
 
 print_error() {
-    echo -e "${RED} ${1}${NC}"
+    echo -e "${RED}[ERROR] ${1}${NC}"
 }
 
 # Function to check if command exists
@@ -39,13 +39,33 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# Function to check if Docker daemon is running
+docker_daemon_running() {
+    if command_exists docker; then
+        docker info >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
 # Function to run with Docker
 run_docker() {
     print_info "Starting Smart Waste Monitoring with Docker Compose..."
 
+    # Check if Docker is installed
     if ! command_exists docker-compose && ! command_exists docker; then
         print_error "Docker not found. Please install Docker and Docker Compose."
-        exit 1
+        print_warning "Falling back to local development mode..."
+        run_local
+        return
+    fi
+
+    # Check if Docker daemon is running
+    if ! docker_daemon_running; then
+        print_error "Docker daemon is not running. Please start Docker Desktop."
+        print_warning "Falling back to local development mode..."
+        run_local
+        return
     fi
 
     # Check if .env exists, create from example if not
@@ -82,8 +102,17 @@ run_docker() {
 run_local() {
     print_info "Starting Smart Waste Monitoring in local development mode..."
 
+    # Get project root
+    PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    cd "$PROJECT_ROOT"
+
     # Check Python
-    if ! command_exists python && ! command_exists python3; then
+    PYTHON_CMD=""
+    if command_exists python3; then
+        PYTHON_CMD="python3"
+    elif command_exists python; then
+        PYTHON_CMD="python"
+    else
         print_error "Python not found. Please install Python 3.10+"
         exit 1
     fi
@@ -94,6 +123,36 @@ run_local() {
         exit 1
     fi
 
+    # Setup Python virtual environment
+    VENV_DIR="$PROJECT_ROOT/venv"
+    if [ ! -d "$VENV_DIR" ]; then
+        print_info "Creating Python virtual environment..."
+        $PYTHON_CMD -m venv "$VENV_DIR"
+        print_success "Virtual environment created"
+    fi
+
+    # Activate virtual environment
+    print_info "Activating virtual environment..."
+    source "$VENV_DIR/bin/activate"
+
+    # Add project root to PYTHONPATH
+    export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
+
+    # Install Python dependencies
+    print_info "Installing Python dependencies..."
+    pip install --upgrade pip --quiet >/dev/null 2>&1
+    if [ -f "requirements.txt" ]; then
+        pip install -r requirements.txt --quiet >/dev/null 2>&1
+        print_success "Python dependencies installed"
+    else
+        print_warning "requirements.txt not found"
+    fi
+
+    # Create data directories
+    print_info "Creating data directories..."
+    mkdir -p data/videos data/frames data/results/visualizations data/results/debug data/results/mistakes
+    print_success "Data directories ready"
+
     # Check if .env exists
     if [ ! -f ".env" ]; then
         print_warning ".env file not found. Creating from .env.example..."
@@ -103,34 +162,48 @@ run_local() {
         fi
     fi
 
-    # Run database migrations
-    print_info "Running database migrations..."
-    cd backend
-    alembic upgrade head || print_warning "Migration may have failed, continuing..."
-    cd ..
+    # Skip database migrations for now (if no database setup)
+    # print_info "Running database migrations..."
+    # cd backend
+    # alembic upgrade head || print_warning "Migration may have failed, continuing..."
+    # cd ..
 
     # Start backend in background
     print_info "Starting backend server..."
-    python backend/main.py &
+    $PYTHON_CMD backend/main.py > .backend.log 2>&1 &
     BACKEND_PID=$!
 
     # Wait for backend to start
     sleep 3
 
+    # Check if backend is running
+    if ! ps -p $BACKEND_PID > /dev/null 2>&1; then
+        print_error "Backend failed to start. Check .backend.log for details"
+        cat .backend.log
+        exit 1
+    fi
+
     # Start dashboard
     print_info "Starting dashboard..."
     cd dashboard
-    npm install --silent
-    npm run dev &
+    if [ ! -d "node_modules" ]; then
+        print_info "Installing npm dependencies..."
+        npm install --silent >/dev/null 2>&1
+    fi
+    npm run dev > ../.dashboard.log 2>&1 &
     DASHBOARD_PID=$!
     cd ..
 
     print_success "Services started!"
     echo ""
     print_info "Access points:"
-    echo "  " Dashboard:  http://localhost:3000"
-    echo "  " Backend:    http://localhost:8000"
-    echo "  " API Docs:   http://localhost:8000/docs"
+    echo "  Dashboard:  http://localhost:3000"
+    echo "  Backend:    http://localhost:8000"
+    echo "  API Docs:   http://localhost:8000/docs"
+    echo ""
+    print_info "Logs:"
+    echo "  Backend:    .backend.log"
+    echo "  Dashboard:  .dashboard.log"
     echo ""
     print_info "Running in background. Press Ctrl+C to stop."
 
@@ -208,11 +281,11 @@ show_help() {
     echo "Usage: ./run.sh [COMMAND]"
     echo ""
     echo "Commands:"
-    echo "  start [docker|local]  Start the application (default: docker)"
+    echo '  start [docker|local]  Start the application (default: docker)'
     echo "  stop                  Stop all services"
     echo "  restart               Restart all services"
     echo "  status                Show service status"
-    echo "  logs                  Show service logs (Docker only)"
+    echo '  logs                  Show service logs (Docker only)'
     echo "  migrate               Run database migrations"
     echo "  help                  Show this help message"
     echo ""

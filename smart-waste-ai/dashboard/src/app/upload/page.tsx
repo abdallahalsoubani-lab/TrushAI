@@ -30,6 +30,19 @@ interface UploadResult {
   confidence: number;
   bins_detected: number;
   message?: string;
+  frames_analyzed?: number;
+  frame_indices?: number[];
+  sampling_strategy?: string;
+  debug_artifacts?: {
+    overlay_image?: string;
+    cropped_bins?: string[];
+    metadata?: string;
+    frames?: string[];
+    annotated?: string[];
+  };
+  metadata?: {
+    detections_summary?: Array<{ frame_index: number; count: number }>;
+  };
 }
 
 // Type for batch upload response
@@ -62,6 +75,9 @@ export default function UploadPage() {
   const [loading, setLoading] = useState<boolean>(false);
   const [result, setResult] = useState<UploadResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [debugEnabled, setDebugEnabled] = useState<boolean>(false);
+  const [serviceInfo, setServiceInfo] = useState<any | null>(null);
+  const [debugOpen, setDebugOpen] = useState<boolean>(false);
 
   // Batch upload state
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
@@ -120,6 +136,7 @@ export default function UploadPage() {
       // Create FormData
       const formData = new FormData();
       formData.append('file', selectedFile);
+      formData.append('debug', debugEnabled ? 'true' : 'false');
 
       // Upload and analyze
       const response = await fetch('http://localhost:8000/api/v1/analyze-upload', {
@@ -134,6 +151,12 @@ export default function UploadPage() {
 
       const data: UploadResult = await response.json();
       setResult(data);
+
+      const infoRes = await fetch('http://localhost:8000/api/v1/service-info');
+      if (infoRes.ok) {
+        const infoData = await infoRes.json();
+        setServiceInfo(infoData);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to analyze file');
     } finally {
@@ -147,10 +170,34 @@ export default function UploadPage() {
     setPreviewUrl(null);
     setResult(null);
     setError(null);
+    setDebugEnabled(false);
+    setServiceInfo(null);
+    setDebugOpen(false);
     setSelectedFiles([]);
     setFilePreviews([]);
     setBatchResult(null);
     setBatchError(null);
+  };
+
+  const handleCopyDebugReport = async () => {
+    if (!result || !selectedFile) return;
+    const report = {
+      timestamp: new Date().toISOString(),
+      request: {
+        endpoint: 'POST /api/v1/analyze-upload',
+        debug: debugEnabled,
+        filename: selectedFile.name,
+        size_bytes: selectedFile.size,
+      },
+      response: result,
+      service_info: {
+        detector_weights: serviceInfo?.detector_weights,
+        detector_classes: serviceInfo?.detector_classes,
+        confidence_threshold: serviceInfo?.detector_info?.confidence_threshold,
+        device: serviceInfo?.detector_info?.device,
+      },
+    };
+    await navigator.clipboard.writeText(JSON.stringify(report, null, 2));
   };
 
   // Handle multiple file selection for batch upload
@@ -368,6 +415,20 @@ export default function UploadPage() {
             </div>
           )}
 
+          {/* Debug Toggle */}
+          <div className="mb-6 flex items-center gap-3">
+            <input
+              id="debug-toggle"
+              type="checkbox"
+              checked={debugEnabled}
+              onChange={(e) => setDebugEnabled(e.target.checked)}
+              className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+            />
+            <label htmlFor="debug-toggle" className="text-sm text-gray-700">
+              Debug mode (save random frames + annotated detections)
+            </label>
+          </div>
+
           {/* Action Buttons */}
           <div className="flex gap-4">
             <button
@@ -465,6 +526,90 @@ export default function UploadPage() {
               {result.message && (
                 <p className="mt-4 text-sm text-gray-600">{result.message}</p>
               )}
+
+              {result.frames_analyzed !== undefined && (
+                <p className="mt-2 text-xs text-gray-500">
+                  Frames analyzed: {result.frames_analyzed} (indices: {result.frame_indices?.join(', ') || '-'})
+                </p>
+              )}
+
+              {result.status === 'NO_BIN_DETECTED' && (
+                <p className="mt-2 text-xs text-orange-600">
+                  Tip: Try increasing max_frames or switching sampling strategy.
+                </p>
+              )}
+
+              <div className="mt-6 border-t border-gray-200 pt-4">
+                <button
+                  onClick={() => setDebugOpen(!debugOpen)}
+                  className="text-sm text-blue-700 hover:text-blue-900"
+                >
+                  {debugOpen ? 'Hide Debug Report' : 'Show Debug Report'}
+                </button>
+
+                {debugOpen && (
+                  <div className="mt-3 text-xs text-gray-700 space-y-2">
+                    <div>
+                      <span className="text-gray-500">Status:</span> {result.status} |{' '}
+                      <span className="text-gray-500">Bins:</span> {result.bins_detected} |{' '}
+                      <span className="text-gray-500">Confidence:</span> {result.confidence}
+                    </div>
+                    {result.message && (
+                      <div>
+                        <span className="text-gray-500">Message:</span> {result.message}
+                      </div>
+                    )}
+                    {result.frames_analyzed !== undefined && (
+                      <div>
+                        <span className="text-gray-500">Frames analyzed:</span>{' '}
+                        {result.frames_analyzed} |{' '}
+                        <span className="text-gray-500">Indices:</span>{' '}
+                        {result.frame_indices?.join(', ') || '-'} |{' '}
+                        <span className="text-gray-500">Strategy:</span>{' '}
+                        {result.sampling_strategy || '-'}
+                      </div>
+                    )}
+                    {serviceInfo && (
+                      <div>
+                        <span className="text-gray-500">Detector weights:</span>{' '}
+                        {serviceInfo?.detector_weights || '-'} |{' '}
+                        <span className="text-gray-500">Classes:</span>{' '}
+                        {serviceInfo?.detector_classes?.join(', ') || '-'}
+                      </div>
+                    )}
+                    {result.metadata?.detections_summary && (
+                      <div>
+                        <span className="text-gray-500">Detections summary:</span>{' '}
+                        {result.metadata.detections_summary
+                          .map((d) => `${d.frame_index}:${d.count}`)
+                          .join(' , ')}
+                      </div>
+                    )}
+                    {result.debug_artifacts && (
+                      <div>
+                        <span className="text-gray-500">Debug artifacts:</span>{' '}
+                        {result.debug_artifacts.metadata ||
+                          result.debug_artifacts.overlay_image ||
+                          '-'}
+                      </div>
+                    )}
+
+                    <div className="flex items-center gap-3 pt-2">
+                      <button
+                        onClick={handleCopyDebugReport}
+                        className="px-3 py-1 rounded bg-gray-800 text-white hover:bg-gray-900"
+                      >
+                        Copy Debug Report
+                      </button>
+                      {result.debug_artifacts?.metadata && (
+                        <span className="text-gray-500">
+                          Debug metadata: {result.debug_artifacts.metadata}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
           )}
         </div>

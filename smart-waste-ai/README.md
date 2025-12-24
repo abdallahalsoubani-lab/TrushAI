@@ -243,6 +243,21 @@ curl http://localhost:8000/api/v1/bins-status/bin_001
 
 Or view in the dashboard at http://localhost:3000
 
+---
+
+## 🧠 Custom Model Training (Recommended)
+
+The default `yolov8n.pt` is COCO and does **not** include a trash container class.
+
+For production, train a custom single-class model named `trash_container` and place
+the weights as `bins.pt` in the project root (auto-loaded), or set:
+
+```bash
+export YOLO_WEIGHTS_PATH=/absolute/path/to/best.pt
+```
+
+See `TRAINING.md` for the full dataset prep, training, and evaluation workflow.
+
 ### 6. Upload & Analyze Files (NEW!)
 
 You can now upload video or image files directly for analysis!
@@ -257,6 +272,29 @@ You can now upload video or image files directly for analysis!
    - 🟢 **GREEN** = EMPTY
    - 🟠 **ORANGE** = HALF
    - 🔴 **RED** = FULL
+
+---
+
+## 🧪 Train a Custom Model (UI)
+
+Open `http://localhost:3000/train` to:
+- Upload images
+- Draw one bounding box per image
+- Auto split train/val
+- Start YOLOv8 training and monitor progress
+- Download `best.pt` and activate it for inference
+
+For full details, see `TRAINING.md`.
+
+## 🍎 Apple Silicon (MPS)
+
+If you are on macOS with Apple Silicon:
+
+```bash
+pip install ultralytics torch torchvision
+```
+
+Use `device=mps` or `device=auto` during training.
 
 #### Option B: Using cURL
 

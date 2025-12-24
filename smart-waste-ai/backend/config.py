@@ -19,6 +19,13 @@ class BackendConfig:
     DATA_DIR = PROJECT_ROOT / "data"
     RESULTS_DIR = DATA_DIR / "results"
     UPLOADS_DIR = DATA_DIR / "uploads"
+    TRAINING_DIR = DATA_DIR / "training"
+    TRAINING_IMAGES_RAW = TRAINING_DIR / "images_raw"
+    TRAINING_LABELS_RAW = TRAINING_DIR / "labels_raw"
+    TRAINING_DATASET_DIR = TRAINING_DIR / "dataset"
+    TRAINING_STATUS_FILE = TRAINING_DIR / "status.json"
+    TRAINING_LOG_FILE = TRAINING_DIR / "train.log"
+    TRAINING_WEIGHTS_DIR = PROJECT_ROOT / "backend" / "weights"
 
     # Database
     DATABASE_URL: str = os.getenv(
@@ -82,6 +89,11 @@ class BackendConfig:
             cls.TEMP_UPLOAD_DIR,
             cls.ANALYSIS_STORAGE_DIR,
             cls.DEBUG_OUTPUT_DIR,
+            cls.TRAINING_DIR,
+            cls.TRAINING_IMAGES_RAW,
+            cls.TRAINING_LABELS_RAW,
+            cls.TRAINING_DATASET_DIR,
+            cls.TRAINING_WEIGHTS_DIR,
         ]
         for directory in directories:
             directory.mkdir(parents=True, exist_ok=True)
