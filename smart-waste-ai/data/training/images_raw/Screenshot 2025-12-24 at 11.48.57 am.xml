@@ -1,0 +1,26 @@
+<annotation>
+	<folder>images_raw</folder>
+	<filename>Screenshot 2025-12-24 at 11.48.57 am.png</filename>
+	<path>/Users/soubani/Desktop/TrushAI/smart-waste-ai/data/training/images_raw/Screenshot 2025-12-24 at 11.48.57 am.png</path>
+	<source>
+		<database>Unknown</database>
+	</source>
+	<size>
+		<width>1278</width>
+		<height>1740</height>
+		<depth>3</depth>
+	</size>
+	<segmented>0</segmented>
+	<object>
+		<name>trash_container</name>
+		<pose>Unspecified</pose>
+		<truncated>0</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>8</xmin>
+			<ymin>41</ymin>
+			<xmax>1220</xmax>
+			<ymax>1672</ymax>
+		</bndbox>
+	</object>
+</annotation>

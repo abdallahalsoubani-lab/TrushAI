@@ -137,7 +137,7 @@ class Config:
 
     # Minimum detections of the same bin across frames to consider it valid
     # This helps filter out false positives
-    MIN_DETECTIONS_FOR_VALID_BIN: int = 3
+    MIN_DETECTIONS_FOR_VALID_BIN: int = 1
 
     # Voting strategy for aggregating fill levels across frames
     # Options: 'majority', 'conservative', 'latest'

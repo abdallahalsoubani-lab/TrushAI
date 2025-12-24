@@ -1,0 +1,26 @@
+<annotation>
+	<folder>images_raw</folder>
+	<filename>IMG_4940.jpg</filename>
+	<path>/Users/soubani/Desktop/TrushAI/smart-waste-ai/data/training/images_raw/IMG_4940.jpg</path>
+	<source>
+		<database>Unknown</database>
+	</source>
+	<size>
+		<width>4284</width>
+		<height>5712</height>
+		<depth>3</depth>
+	</size>
+	<segmented>0</segmented>
+	<object>
+		<name>trash_container</name>
+		<pose>Unspecified</pose>
+		<truncated>0</truncated>
+		<difficult>0</difficult>
+		<bndbox>
+			<xmin>792</xmin>
+			<ymin>1943</ymin>
+			<xmax>2367</xmax>
+			<ymax>3318</ymax>
+		</bndbox>
+	</object>
+</annotation>
