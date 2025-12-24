@@ -729,6 +729,112 @@ async def analyze_upload(
 
 
 @router.post(
+    "/analyze-frame",
+    summary="Analyze Single Frame",
+    description="Analyze a single video frame for bin detections"
+)
+async def analyze_frame(
+    file: UploadFile = File(...),
+    save: bool = Query(False),
+    session_id: Optional[str] = Query(None)
+):
+    try:
+        service = get_inference_service()
+        if not service.models_loaded:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="AI models not loaded. Service initializing..."
+            )
+
+        import cv2
+        import numpy as np
+
+        contents = await file.read()
+        nparr = np.frombuffer(contents, np.uint8)
+        image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if image is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Failed to decode image"
+            )
+
+        detections = service.pipeline.detector.detect(image)
+        if not detections:
+            return {
+                "detections": [],
+                "bins_detected": 0,
+                "status": "NO_BIN_DETECTED",
+                "confidence": 0.0,
+                "frame_ts": datetime.now().isoformat(),
+            }
+
+        h, w = image.shape[:2]
+        results = []
+        classifications = []
+        for det in detections:
+            cropped = det.crop_from_image(image)
+            classification = service.pipeline.classifier.classify(cropped)
+            classifications.append(classification)
+            x1, y1, x2, y2 = det.bbox
+            results.append({
+                "bbox": [
+                    round(x1 / w, 6),
+                    round(y1 / h, 6),
+                    round(x2 / w, 6),
+                    round(y2 / h, 6),
+                ],
+                "conf": float(det.confidence),
+                "label": "trash_container",
+                "fill_status": classification.fill_level.value,
+                "fill_conf": float(classification.confidence),
+                "track_id": None,
+            })
+
+        level_order = {"EMPTY": 0, "HALF": 1, "FULL": 2}
+        fullest = max(classifications, key=lambda c: level_order[c.fill_level.value])
+
+        response = {
+            "detections": results,
+            "bins_detected": len(results),
+            "status": fullest.fill_level.value,
+            "confidence": float(fullest.confidence),
+            "frame_ts": datetime.now().isoformat(),
+        }
+
+        if save:
+            session_id = session_id or datetime.now().strftime("session_%Y%m%d")
+            session_dir = backend_config.CAPTURES_DIR / session_id
+            session_dir.mkdir(parents=True, exist_ok=True)
+            capture_id = uuid.uuid4().hex[:8]
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            image_name = f"{timestamp}_{capture_id}.jpg"
+            metadata_name = f"{timestamp}_{capture_id}.json"
+            image_path = session_dir / image_name
+            metadata_path = session_dir / metadata_name
+
+            cv2.imwrite(str(image_path), image)
+            with open(metadata_path, "w") as f:
+                json.dump(response, f, indent=2)
+
+            response["saved"] = {
+                "session_id": session_id,
+                "capture_id": capture_id,
+                "image_file": image_name,
+                "metadata_file": metadata_name,
+            }
+
+        return response
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Analyze frame failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Analyze frame failed: {str(e)}"
+        )
+
+
+@router.post(
     "/dataset/upload",
     summary="Upload Training Images",
     description="Upload multiple images for training dataset"
@@ -995,7 +1101,7 @@ async def train_download_artifact(artifact: str):
     description="Fetch debug metadata JSON for an artifact id"
 )
 async def debug_artifacts_metadata(artifact_id: str):
-    if not re.match(r"^[A-Za-z0-9_]+$", artifact_id):
+    if not re.match(r"^[A-Za-z0-9_-]+$", artifact_id):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact id")
     metadata_path = backend_config.DEBUG_OUTPUT_DIR / f"{artifact_id}_debug_metadata.json"
     if not metadata_path.exists():
@@ -1011,7 +1117,7 @@ async def debug_artifacts_metadata(artifact_id: str):
     description="Fetch original debug frame image"
 )
 async def debug_artifacts_frame(artifact_id: str, frame_index: int):
-    if not re.match(r"^[A-Za-z0-9_]+$", artifact_id):
+    if not re.match(r"^[A-Za-z0-9_-]+$", artifact_id):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact id")
     frame_path = backend_config.DEBUG_OUTPUT_DIR / f"{artifact_id}_frame_{frame_index}.jpg"
     if not frame_path.exists():
@@ -1025,7 +1131,7 @@ async def debug_artifacts_frame(artifact_id: str, frame_index: int):
     description="Fetch annotated debug frame image"
 )
 async def debug_artifacts_annotated(artifact_id: str, frame_index: int):
-    if not re.match(r"^[A-Za-z0-9_]+$", artifact_id):
+    if not re.match(r"^[A-Za-z0-9_-]+$", artifact_id):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact id")
     annotated_path = backend_config.DEBUG_OUTPUT_DIR / f"{artifact_id}_frame_{frame_index}_annotated.jpg"
     if not annotated_path.exists():

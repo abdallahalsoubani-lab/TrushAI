@@ -296,6 +296,24 @@ pip install ultralytics torch torchvision
 
 Use `device=mps` or `device=auto` during training.
 
+---
+
+## 📷 Live Camera Walk Scan
+
+Open `http://localhost:3000/walk-scan` to run live bin detection from your webcam.
+
+Controls:
+- Start/Stop camera
+- Clear captured bins
+- Export JSON of captured bins
+
+### Backend API (single frame)
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/v1/analyze-frame" \
+  -F "file=@/path/to/frame.jpg" | python3 -m json.tool
+```
+
 #### Option B: Using cURL
 
 ```bash

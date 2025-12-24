@@ -362,12 +362,20 @@ export default function UploadPage() {
                 Upload images or videos to detect trash bin fill levels
               </p>
             </div>
-            <Link
-              href="/"
-              className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition"
-            >
-              Back to Dashboard
-            </Link>
+            <div className="flex gap-3">
+              <Link
+                href="/"
+                className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition"
+              >
+                Back to Dashboard
+              </Link>
+              <Link
+                href="/walk-scan"
+                className="px-4 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-700 transition"
+              >
+                Walk Scan
+              </Link>
+            </div>
           </div>
         </div>
       </header>

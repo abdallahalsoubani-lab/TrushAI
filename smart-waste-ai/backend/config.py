@@ -19,6 +19,7 @@ class BackendConfig:
     DATA_DIR = PROJECT_ROOT / "data"
     RESULTS_DIR = DATA_DIR / "results"
     UPLOADS_DIR = DATA_DIR / "uploads"
+    CAPTURES_DIR = RESULTS_DIR / "captures"
     TRAINING_DIR = DATA_DIR / "training"
     TRAINING_IMAGES_RAW = TRAINING_DIR / "images_raw"
     TRAINING_LABELS_RAW = TRAINING_DIR / "labels_raw"
@@ -89,6 +90,7 @@ class BackendConfig:
             cls.TEMP_UPLOAD_DIR,
             cls.ANALYSIS_STORAGE_DIR,
             cls.DEBUG_OUTPUT_DIR,
+            cls.CAPTURES_DIR,
             cls.TRAINING_DIR,
             cls.TRAINING_IMAGES_RAW,
             cls.TRAINING_LABELS_RAW,

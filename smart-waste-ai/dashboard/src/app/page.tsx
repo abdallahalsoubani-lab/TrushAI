@@ -145,6 +145,12 @@ export default function Home() {
                 Upload File
               </Link>
               <Link
+                href="/walk-scan"
+                className="px-4 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-700 transition"
+              >
+                Walk Scan
+              </Link>
+              <Link
                 href="/train"
                 className="px-4 py-2 bg-gray-800 text-white rounded-lg hover:bg-gray-900 transition"
               >
