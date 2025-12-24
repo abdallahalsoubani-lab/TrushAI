@@ -13,14 +13,16 @@ Endpoints:
 """
 
 import logging
+import re
 import tempfile
 import shutil
 import json
 import uuid
 from datetime import datetime
 from typing import Optional, List, Dict
-from fastapi import APIRouter, HTTPException, status, UploadFile, File, Depends, Query, Form
+from fastapi import APIRouter, HTTPException, status, UploadFile, File, Depends, Query, Form, Request
 from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse
 from pathlib import Path
 from sqlalchemy.orm import Session
 
@@ -360,6 +362,7 @@ async def clear_cache():
     }
 )
 async def analyze_upload(
+    request: Request,
     file: UploadFile = File(...),
     debug: bool = Form(False)
 ):
@@ -428,7 +431,15 @@ async def analyze_upload(
 
         logger.info(f"API: Saved upload to: {temp_file_path}")
 
-        debug_enabled = debug or config.DEBUG_MODE
+        debug_query = request.query_params.get("debug")
+        debug_from_query = False
+        if isinstance(debug_query, str):
+            debug_from_query = debug_query.strip().lower() in {"1", "true", "yes", "on"}
+
+        debug_enabled = (debug or debug_from_query) or config.DEBUG_MODE
+        logger.info(
+            f"API: debug_enabled={debug_enabled} debug_form={debug} debug_query={debug_from_query}"
+        )
 
         # Process based on file type
         if input_type == "video":
@@ -439,25 +450,57 @@ async def analyze_upload(
                 frame_skip=3,  # Process every 3 seconds for faster results
                 max_frames=30,  # Limit frames for quick analysis
                 save_visualizations=False,  # Don't save visualizations for uploads
-                debug=debug_enabled
+                debug=debug_enabled,
+                min_detections=1
             )
 
             metadata = result.metadata or {}
             detections = metadata.get("detections", [])
-            detected_total = 0
+            detections_total = 0
+            frames_with_detections = 0
+
             if isinstance(detections, list):
-                detected_total = sum(
-                    d.get("count", 0) for d in detections if isinstance(d, dict)
-                )
-            effective_bins_detected = max(result.bins_detected or 0, detected_total)
+                for d in detections:
+                    if isinstance(d, dict):
+                        c = int(d.get("count", 0) or 0)
+                        detections_total += c
+                        if c > 0:
+                            frames_with_detections += 1
+
+            unique_bins = int(result.bins_detected or 0)
+            effective_bins_detected = unique_bins or (1 if detections_total > 0 else 0)
+
+            metadata["detections_total"] = detections_total
+            metadata["frames_with_detections"] = frames_with_detections
+
             print(
-                f"[analyze-upload] effective={effective_bins_detected} "
-                f"orig={result.bins_detected} detected_total={detected_total} "
-                f"frame_indices={metadata.get('frame_indices')}"
+                f"[analyze-upload] unique_bins={unique_bins} detections_total={detections_total} "
+                f"frames_with_detections={frames_with_detections} frame_indices={metadata.get('frame_indices')}"
             )
 
-            # Check if any bins were detected
-            if effective_bins_detected == 0:
+            # Case 1: tracking removed it but we did see detections
+            if unique_bins == 0 and detections_total > 0:
+                max_conf = 0.5
+                if isinstance(detections, list):
+                    for frame in detections:
+                        items = frame.get("items", []) if isinstance(frame, dict) else []
+                        for item in items:
+                            if isinstance(item, dict):
+                                max_conf = max(max_conf, float(item.get("confidence", 0.0)))
+                return UploadAnalysisResponse(
+                    input_type=input_type,
+                    status="BIN_DETECTED",
+                    confidence=round(min(1.0, max_conf), 2),
+                    bins_detected=1,
+                    message="Bin detected in frames but tracking/filter removed it (min_detections).",
+                    debug_artifacts=result.debug_artifacts if debug_enabled else None,
+                    frames_analyzed=metadata.get("frames_analyzed"),
+                    frame_indices=metadata.get("frame_indices"),
+                    sampling_strategy=metadata.get("sampling_strategy"),
+                )
+
+            # Case 2: no detections at all
+            if unique_bins == 0:
                 return UploadAnalysisResponse(
                     input_type=input_type,
                     status="NO_BIN_DETECTED",
@@ -486,6 +529,19 @@ async def analyze_upload(
                 total_confidence += bin_response.confidence
 
             # Get the fullest level detected (conservative approach)
+            if not bins_by_level:
+                return UploadAnalysisResponse(
+                    input_type=input_type,
+                    status="BIN_DETECTED",
+                    confidence=0.0,
+                    bins_detected=unique_bins,
+                    message="Bin detected but no valid classifications to aggregate.",
+                    debug_artifacts=result.debug_artifacts if debug_enabled else None,
+                    frames_analyzed=result.metadata.get("frames_analyzed"),
+                    frame_indices=result.metadata.get("frame_indices"),
+                    sampling_strategy=result.metadata.get("sampling_strategy"),
+                )
+
             overall_status = max(bins_by_level.keys(), key=lambda x: level_order[x])
 
             # Average confidence for that level
@@ -500,7 +556,7 @@ async def analyze_upload(
                 input_type=input_type,
                 status=overall_status,
                 confidence=round(avg_confidence, 2),
-                bins_detected=effective_bins_detected,
+                bins_detected=unique_bins,
                 message="Video analysis complete",
                 debug_artifacts=result.debug_artifacts if debug_enabled else None,
                 frames_analyzed=result.metadata.get("frames_analyzed"),
@@ -931,6 +987,50 @@ async def train_download_artifact(artifact: str):
             detail="Artifact not found"
         )
     return FileResponse(target)
+
+
+@router.get(
+    "/debug-artifacts/{artifact_id}/metadata",
+    summary="Get Debug Metadata",
+    description="Fetch debug metadata JSON for an artifact id"
+)
+async def debug_artifacts_metadata(artifact_id: str):
+    if not re.match(r"^[A-Za-z0-9_]+$", artifact_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact id")
+    metadata_path = backend_config.DEBUG_OUTPUT_DIR / f"{artifact_id}_debug_metadata.json"
+    if not metadata_path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Metadata not found")
+    with open(metadata_path, "r") as f:
+        data = json.load(f)
+    return JSONResponse(content=data)
+
+
+@router.get(
+    "/debug-artifacts/{artifact_id}/frame/{frame_index}",
+    summary="Get Debug Frame",
+    description="Fetch original debug frame image"
+)
+async def debug_artifacts_frame(artifact_id: str, frame_index: int):
+    if not re.match(r"^[A-Za-z0-9_]+$", artifact_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact id")
+    frame_path = backend_config.DEBUG_OUTPUT_DIR / f"{artifact_id}_frame_{frame_index}.jpg"
+    if not frame_path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Frame not found")
+    return FileResponse(str(frame_path))
+
+
+@router.get(
+    "/debug-artifacts/{artifact_id}/annotated/{frame_index}",
+    summary="Get Annotated Debug Frame",
+    description="Fetch annotated debug frame image"
+)
+async def debug_artifacts_annotated(artifact_id: str, frame_index: int):
+    if not re.match(r"^[A-Za-z0-9_]+$", artifact_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact id")
+    annotated_path = backend_config.DEBUG_OUTPUT_DIR / f"{artifact_id}_frame_{frame_index}_annotated.jpg"
+    if not annotated_path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Annotated frame not found")
+    return FileResponse(str(annotated_path))
 
 
 @router.post(

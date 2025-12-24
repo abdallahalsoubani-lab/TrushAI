@@ -86,7 +86,8 @@ class InferenceService:
         frame_skip: Optional[int] = None,
         max_frames: Optional[int] = None,
         save_visualizations: Optional[bool] = None,
-        debug: Optional[bool] = None
+        debug: Optional[bool] = None,
+        min_detections: Optional[int] = None
     ) -> VideoAnalysisResponse:
         """
         Analyze a video and detect trash bins with fill levels.
@@ -125,7 +126,8 @@ class InferenceService:
                 frame_skip=frame_skip,
                 max_frames=max_frames,
                 save_visualizations=save_visualizations,
-                debug=debug
+                debug=debug,
+                min_detections=min_detections
             )
 
             # Convert bin instances to API response format
@@ -148,21 +150,11 @@ class InferenceService:
             # Build response
             metadata = result.metadata or {}
             detections = metadata.get("detections", [])
-            detected_total = 0
-            if isinstance(detections, list):
-                detected_total = sum(d.get("count", 0) for d in detections if isinstance(d, dict))
-
             metadata["detections_summary"] = [
                 {"frame_index": d.get("frame_index"), "count": d.get("count", 0)}
                 for d in detections
                 if isinstance(d, dict)
             ]
-
-            bins_detected = max(len(bin_responses), detected_total)
-            print(
-                "[analyze_video] bins_detected=%s len(bin_responses)=%s detected_total=%s frame_indices=%s"
-                % (bins_detected, len(bin_responses), detected_total, metadata.get("frame_indices"))
-            )
 
             response = VideoAnalysisResponse(
                 job_id=job_id,
@@ -170,7 +162,7 @@ class InferenceService:
                 video_path=result.video_path,
                 total_frames=result.total_frames,
                 processed_frames=result.processed_frames,
-                bins_detected=bins_detected,
+                bins_detected=len(bin_responses),
                 bins=bin_responses,
                 processing_time=result.processing_time,
                 metadata=metadata,

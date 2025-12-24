@@ -121,7 +121,8 @@ class InferencePipeline:
         save_visualizations: bool = None,
         debug: Optional[bool] = None,
         debug_confidence_override: Optional[float] = None,
-        sampling_strategy: Optional[str] = None
+        sampling_strategy: Optional[str] = None,
+        min_detections: Optional[int] = None
     ) -> PipelineResult:
         """
         Process entire video and return bin status.
@@ -160,6 +161,7 @@ class InferencePipeline:
             confidence_override = 0.15
 
         sampling_strategy = sampling_strategy or config.VIDEO_SAMPLING_STRATEGY
+        min_detections = min_detections or config.MIN_DETECTIONS_FOR_VALID_BIN
         # Extract and process frames
         frames, frame_info, frame_indices = self._extract_frames(
             video_path,
@@ -179,6 +181,7 @@ class InferencePipeline:
         # Process each frame
         all_detections = []
         analyzed_indices = []
+        stopped_early = False
         for i, frame in enumerate(frames):
             frame_idx = frame_indices[i]
             frame_detections = self._process_frame(
@@ -193,12 +196,17 @@ class InferencePipeline:
             logger.debug(
                 f"Frame {frame_idx}: {len(frame_detections)} bins detected"
             )
-            if len(frame_detections) > 0:
+            if (
+                min_detections <= 1
+                and len(frame_detections) > 0
+                and len(analyzed_indices) >= config.EARLY_STOP_MIN_FRAMES
+            ):
                 logger.info("Early stop: bin detected, stopping frame processing")
+                stopped_early = True
                 break
 
         # Track bins across frames
-        tracked_bins = self._track_bins_across_frames(all_detections)
+        tracked_bins = self._track_bins_across_frames(all_detections, min_detections)
 
         logger.info(f"Tracked {len(tracked_bins)} unique bins")
 
@@ -226,7 +234,16 @@ class InferencePipeline:
             f"({len(tracked_bins)} bins detected)"
         )
 
-        return PipelineResult(
+        detections = []
+        if debug_artifacts and debug_artifacts.get("metadata"):
+            try:
+                with open(debug_artifacts["metadata"], "r") as f:
+                    debug_metadata = json.load(f)
+                detections = debug_metadata.get("detections", [])
+            except Exception:
+                detections = []
+
+        result = PipelineResult(
             video_path=str(video_path),
             total_frames=frame_info.get("total_frames") or len(frames),
             processed_frames=len(analyzed_indices),
@@ -241,10 +258,20 @@ class InferencePipeline:
                 "sampling_strategy": sampling_strategy,
                 "frame_indices": analyzed_indices,
                 "frames_analyzed": len(analyzed_indices),
+                "detections": detections,
             }
             ,
             debug_artifacts=debug_artifacts
         )
+        print(
+            f"[pipeline] debug={debug_enabled} "
+            f"detections_in_metadata={len(result.metadata.get('detections', []))}"
+        )
+        print(
+            f"[pipeline] early_stop_min_frames={config.EARLY_STOP_MIN_FRAMES} "
+            f"processed={len(analyzed_indices)} stopped_early={stopped_early}"
+        )
+        return result
 
     def _extract_frames(
         self,
@@ -435,7 +462,8 @@ class InferencePipeline:
 
     def _track_bins_across_frames(
         self,
-        all_detections: List[List[Tuple[Detection, ClassificationResult]]]
+        all_detections: List[List[Tuple[Detection, ClassificationResult]]],
+        min_detections: int
     ) -> List[BinInstance]:
         """
         Track same bins across multiple frames using IoU matching.
@@ -484,7 +512,6 @@ class InferencePipeline:
                     next_bin_id += 1
 
         # Filter out bins with too few detections (likely false positives)
-        min_detections = config.MIN_DETECTIONS_FOR_VALID_BIN
         valid_bins = [
             b for b in tracked_bins
             if len(b.detections) >= min_detections

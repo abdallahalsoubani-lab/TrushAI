@@ -124,6 +124,9 @@ class Config:
     # Sampling strategy: "fixed_percentages" or "every_n"
     VIDEO_SAMPLING_STRATEGY: str = os.getenv("VIDEO_SAMPLING_STRATEGY", "fixed_percentages")
 
+    # Minimum frames to process before allowing early stop
+    EARLY_STOP_MIN_FRAMES: int = int(os.getenv("EARLY_STOP_MIN_FRAMES", "3"))
+
     # Frame format for saving
     FRAME_FORMAT: str = "jpg"
     FRAME_QUALITY: int = 95  # JPEG quality (0-100)

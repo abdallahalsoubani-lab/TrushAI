@@ -23,10 +23,12 @@ import { useState } from 'react';
 import Link from 'next/link';
 import '../globals.css';
 
+const API_BASE = 'http://localhost:8000';
+
 // Type for upload analysis response
 interface UploadResult {
   input_type: string;
-  status: 'EMPTY' | 'HALF' | 'FULL' | 'NO_BIN_DETECTED';
+  status: 'EMPTY' | 'HALF' | 'FULL' | 'NO_BIN_DETECTED' | 'BIN_DETECTED';
   confidence: number;
   bins_detected: number;
   message?: string;
@@ -78,6 +80,8 @@ export default function UploadPage() {
   const [debugEnabled, setDebugEnabled] = useState<boolean>(false);
   const [serviceInfo, setServiceInfo] = useState<any | null>(null);
   const [debugOpen, setDebugOpen] = useState<boolean>(false);
+  const [debugMetadata, setDebugMetadata] = useState<string | null>(null);
+  const [debugMetadataOpen, setDebugMetadataOpen] = useState<boolean>(false);
 
   // Batch upload state
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
@@ -136,10 +140,12 @@ export default function UploadPage() {
       // Create FormData
       const formData = new FormData();
       formData.append('file', selectedFile);
-      formData.append('debug', debugEnabled ? 'true' : 'false');
 
       // Upload and analyze
-      const response = await fetch('http://localhost:8000/api/v1/analyze-upload', {
+      const url = debugEnabled
+        ? `${API_BASE}/api/v1/analyze-upload?debug=true`
+        : `${API_BASE}/api/v1/analyze-upload`;
+      const response = await fetch(url, {
         method: 'POST',
         body: formData,
       });
@@ -152,7 +158,7 @@ export default function UploadPage() {
       const data: UploadResult = await response.json();
       setResult(data);
 
-      const infoRes = await fetch('http://localhost:8000/api/v1/service-info');
+      const infoRes = await fetch(`${API_BASE}/api/v1/service-info`);
       if (infoRes.ok) {
         const infoData = await infoRes.json();
         setServiceInfo(infoData);
@@ -173,10 +179,30 @@ export default function UploadPage() {
     setDebugEnabled(false);
     setServiceInfo(null);
     setDebugOpen(false);
+    setDebugMetadata(null);
+    setDebugMetadataOpen(false);
     setSelectedFiles([]);
     setFilePreviews([]);
     setBatchResult(null);
     setBatchError(null);
+  };
+
+  const extractArtifactId = (metadataPath?: string): string | null => {
+    if (!metadataPath) return null;
+    const filename = metadataPath.split('/').pop() || '';
+    if (!filename.endsWith('_debug_metadata.json')) return null;
+    return filename.replace('_debug_metadata.json', '');
+  };
+
+  const handleFetchDebugMetadata = async (artifactId: string) => {
+    const res = await fetch(`${API_BASE}/api/v1/debug-artifacts/${artifactId}/metadata`);
+    if (!res.ok) {
+      setDebugMetadata('Failed to load metadata');
+      return;
+    }
+    const data = await res.json();
+    setDebugMetadata(JSON.stringify(data, null, 2));
+    setDebugMetadataOpen(true);
   };
 
   const handleCopyDebugReport = async () => {
@@ -287,6 +313,8 @@ export default function UploadPage() {
         return 'bg-orange-500';
       case 'FULL':
         return 'bg-red-500';
+      case 'BIN_DETECTED':
+        return 'bg-blue-500';
       case 'NO_BIN_DETECTED':
         return 'bg-gray-500';
       default:
@@ -303,6 +331,8 @@ export default function UploadPage() {
         return 'text-orange-600';
       case 'FULL':
         return 'text-red-600';
+      case 'BIN_DETECTED':
+        return 'text-blue-600';
       case 'NO_BIN_DETECTED':
         return 'text-gray-600';
       default:
@@ -312,7 +342,9 @@ export default function UploadPage() {
 
   // Format status text for display
   const formatStatus = (status: string): string => {
-    // Replace underscores with spaces and title case
+    if (status === 'BIN_DETECTED') {
+      return 'Detected (untracked)';
+    }
     return status.replace(/_/g, ' ');
   };
 
@@ -527,11 +559,14 @@ export default function UploadPage() {
                 <p className="mt-4 text-sm text-gray-600">{result.message}</p>
               )}
 
-              {result.frames_analyzed !== undefined && (
-                <p className="mt-2 text-xs text-gray-500">
-                  Frames analyzed: {result.frames_analyzed} (indices: {result.frame_indices?.join(', ') || '-'})
-                </p>
-              )}
+              <div className="mt-3 text-xs text-gray-600 space-y-1">
+                <div>
+                  Frames analyzed: {result.frames_analyzed ?? '-'} (indices: {result.frame_indices?.join(', ') || '-'})
+                </div>
+                <div>
+                  Sampling strategy: {result.sampling_strategy || '-'}
+                </div>
+              </div>
 
               {result.status === 'NO_BIN_DETECTED' && (
                 <p className="mt-2 text-xs text-orange-600">
@@ -601,15 +636,56 @@ export default function UploadPage() {
                       >
                         Copy Debug Report
                       </button>
-                      {result.debug_artifacts?.metadata && (
-                        <span className="text-gray-500">
-                          Debug metadata: {result.debug_artifacts.metadata}
-                        </span>
-                      )}
+                      {result.debug_artifacts?.metadata && (() => {
+                        const artifactId = extractArtifactId(result.debug_artifacts.metadata);
+                        if (!artifactId) {
+                          return (
+                            <span className="text-gray-500">
+                              Debug metadata: {result.debug_artifacts.metadata}
+                            </span>
+                          );
+                        }
+                        return (
+                          <button
+                            onClick={() => handleFetchDebugMetadata(artifactId)}
+                            className="px-3 py-1 rounded bg-gray-200 text-gray-700 hover:bg-gray-300"
+                          >
+                            View metadata
+                          </button>
+                        );
+                      })()}
                     </div>
+
+                    {debugMetadataOpen && debugMetadata && (
+                      <pre className="bg-gray-900 text-green-200 text-xs p-3 rounded max-h-64 overflow-y-auto whitespace-pre-wrap">
+                        {debugMetadata}
+                      </pre>
+                    )}
                   </div>
                 )}
               </div>
+
+              {result.debug_artifacts?.metadata && (() => {
+                const artifactId = extractArtifactId(result.debug_artifacts.metadata);
+                if (!artifactId || !result.frame_indices?.length) return null;
+                return (
+                  <div className="mt-6 border-t border-gray-200 pt-4">
+                    <h4 className="text-sm font-semibold text-gray-900 mb-2">Debug Artifacts</h4>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      {result.frame_indices.map((frameIndex) => (
+                        <div key={frameIndex} className="bg-white border rounded p-2">
+                          <div className="text-xs text-gray-500 mb-1">Frame {frameIndex} (annotated)</div>
+                          <img
+                            src={`${API_BASE}/api/v1/debug-artifacts/${artifactId}/annotated/${frameIndex}`}
+                            alt={`Annotated frame ${frameIndex}`}
+                            className="w-full h-auto rounded"
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           )}
         </div>

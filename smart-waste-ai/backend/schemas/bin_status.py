@@ -27,11 +27,13 @@ class FillLevelEnum(str, Enum):
     - HALF: Bin is half full
     - FULL: Bin is full
     - NO_BIN_DETECTED: No bin was detected in the image/video
+    - BIN_DETECTED: Bin detected but not tracked/classified
     """
     EMPTY = "EMPTY"
     HALF = "HALF"
     FULL = "FULL"
     NO_BIN_DETECTED = "NO_BIN_DETECTED"
+    BIN_DETECTED = "BIN_DETECTED"
 
 
 class BinStatusResponse(BaseModel):
