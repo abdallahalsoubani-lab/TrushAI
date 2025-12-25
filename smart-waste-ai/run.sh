@@ -34,6 +34,10 @@ print_error() {
     echo -e "${RED}[ERROR] ${1}${NC}"
 }
 
+print_failed() {
+    echo -e "${RED}[FAILED] ${1}${NC}"
+}
+
 # Function to check if command exists
 command_exists() {
     command -v "$1" >/dev/null 2>&1
@@ -211,6 +215,123 @@ run_local() {
     wait $BACKEND_PID $DASHBOARD_PID
 }
 
+# Function to run locally with migrations (walkscan mode)
+run_walkscan() {
+    print_info "Starting Smart Waste Monitoring (walkscan) in local development mode..."
+
+    # Get project root
+    PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    cd "$PROJECT_ROOT"
+
+    # Check Python
+    PYTHON_CMD=""
+    if command_exists python3; then
+        PYTHON_CMD="python3"
+    elif command_exists python; then
+        PYTHON_CMD="python"
+    else
+        print_failed "Python not found. Please install Python 3.10+"
+        exit 1
+    fi
+
+    # Check Node.js
+    if ! command_exists node; then
+        print_failed "Node.js not found. Please install Node.js 18+"
+        exit 1
+    fi
+
+    # Setup Python virtual environment
+    VENV_DIR="$PROJECT_ROOT/venv"
+    if [ ! -d "$VENV_DIR" ]; then
+        print_info "Creating Python virtual environment..."
+        $PYTHON_CMD -m venv "$VENV_DIR"
+        print_success "Virtual environment created"
+    fi
+
+    # Activate virtual environment
+    print_info "Activating virtual environment..."
+    source "$VENV_DIR/bin/activate"
+
+    # Add project root to PYTHONPATH
+    export PYTHONPATH="$PROJECT_ROOT:$PYTHONPATH"
+
+    # Install Python dependencies
+    print_info "Installing Python dependencies..."
+    pip install --upgrade pip --quiet >/dev/null 2>&1
+    if [ -f "requirements.txt" ]; then
+        pip install -r requirements.txt --quiet >/dev/null 2>&1
+        print_success "Python dependencies installed"
+    else
+        print_warning "requirements.txt not found"
+    fi
+
+    # Create data directories
+    print_info "Creating data directories..."
+    mkdir -p data/videos data/frames data/results/visualizations data/results/debug data/results/mistakes data/results/captures
+    print_success "Data directories ready"
+
+    # Check if .env exists
+    if [ ! -f ".env" ]; then
+        print_warning ".env file not found. Creating from .env.example..."
+        if [ -f ".env.example" ]; then
+            cp .env.example .env
+            print_success "Created .env file. Using SQLite by default."
+        fi
+    fi
+
+    # Run database migrations
+    print_info "Running database migrations..."
+    cd backend
+    if ! "$PROJECT_ROOT/venv/bin/alembic" -c alembic.ini upgrade head; then
+        print_failed "Database migrations failed"
+        exit 1
+    fi
+    cd ..
+    print_success "Migrations complete"
+
+    # Start backend in background
+    print_info "Starting backend server..."
+    $PYTHON_CMD backend/main.py > .backend.log 2>&1 &
+    BACKEND_PID=$!
+
+    # Wait for backend to start
+    sleep 3
+
+    # Check if backend is running
+    if ! ps -p $BACKEND_PID > /dev/null 2>&1; then
+        print_failed "Backend failed to start. Check .backend.log for details"
+        cat .backend.log
+        exit 1
+    fi
+
+    # Start dashboard
+    print_info "Starting dashboard..."
+    cd dashboard
+    if [ ! -d "node_modules" ]; then
+        print_info "Installing npm dependencies..."
+        npm install --silent >/dev/null 2>&1
+    fi
+    npm run dev > ../.dashboard.log 2>&1 &
+    DASHBOARD_PID=$!
+    cd ..
+
+    print_success "Services started!"
+    echo ""
+    print_info "Access points:"
+    echo "  Dashboard:  http://localhost:3000"
+    echo "  Backend:    http://localhost:8000"
+    echo "  API Docs:   http://localhost:8000/docs"
+    echo ""
+    print_info "Logs:"
+    echo "  Backend:    .backend.log"
+    echo "  Dashboard:  .dashboard.log"
+    echo ""
+    print_info "Running in background. Press Ctrl+C to stop."
+
+    # Wait for processes
+    wait $BACKEND_PID $DASHBOARD_PID
+}
+
 # Function to stop services
 stop_services() {
     print_info "Stopping services..."
@@ -266,8 +387,18 @@ run_migrations() {
     if command_exists docker-compose || command_exists docker; then
         docker-compose run --rm backend alembic upgrade head
     else
+        # Get project root
+        PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        VENV_DIR="$PROJECT_ROOT/venv"
+        if [ ! -d "$VENV_DIR" ]; then
+            print_failed "Virtual environment not found. Run ./run.sh start walkscan first."
+            exit 1
+        fi
         cd backend
-        alembic upgrade head
+        if ! "$PROJECT_ROOT/venv/bin/alembic" -c alembic.ini upgrade head; then
+            print_failed "Database migrations failed"
+            exit 1
+        fi
         cd ..
     fi
 
@@ -281,7 +412,7 @@ show_help() {
     echo "Usage: ./run.sh [COMMAND]"
     echo ""
     echo "Commands:"
-    echo '  start [docker|local]  Start the application (default: docker)'
+    echo '  start [docker|local|walkscan]  Start the application (default: docker)'
     echo "  stop                  Stop all services"
     echo "  restart               Restart all services"
     echo "  status                Show service status"
@@ -292,6 +423,7 @@ show_help() {
     echo "Examples:"
     echo "  ./run.sh start        # Start with Docker"
     echo "  ./run.sh start local  # Start in local development mode"
+    echo "  ./run.sh start walkscan  # Start local mode + migrations"
     echo "  ./run.sh stop         # Stop all services"
     echo "  ./run.sh logs         # View logs"
 }
@@ -301,6 +433,8 @@ case "${1:-start}" in
     start)
         if [ "${2:-docker}" == "local" ]; then
             run_local
+        elif [ "${2:-docker}" == "walkscan" ]; then
+            run_walkscan
         else
             run_docker
         fi

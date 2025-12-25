@@ -17,6 +17,7 @@ type Detection = {
 
 type CaptureItem = {
   id: number;
+  capture_id?: number;
   timestamp: string;
   fill_status: string;
   conf: number;
@@ -30,6 +31,11 @@ type Track = {
   lastSeen: number;
 };
 
+type Area = {
+  id: number;
+  name: string;
+};
+
 export default function WalkScanPage() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -37,20 +43,68 @@ export default function WalkScanPage() {
   const streamRef = useRef<MediaStream | null>(null);
   const intervalRef = useRef<number | null>(null);
   const inflightRef = useRef<boolean>(false);
+  const frameCounterRef = useRef<number>(0);
   const tracksRef = useRef<Map<number, Track>>(new Map());
-  const trackMetaRef = useRef<Map<number, { hits: number; lastSeen: number }>>(new Map());
+  const trackMetaRef = useRef<Map<number, { hits: number; lastSeen: number; lastCapture: number }>>(new Map());
   const nextIdRef = useRef<number>(1);
-  const capturedIdsRef = useRef<Set<number>>(new Set());
+  const activeAreaIdRef = useRef<number | null>(null);
 
   const [running, setRunning] = useState(false);
-  const [fps, setFps] = useState(2);
+  const [fps, setFps] = useState(4);
   const [detections, setDetections] = useState<Detection[]>([]);
   const [captures, setCaptures] = useState<CaptureItem[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [minConf, setMinConf] = useState(0.25);
-  const [maxArea, setMaxArea] = useState(0.85);
-  const [minArea, setMinArea] = useState(0.02);
-  const [minStableHits, setMinStableHits] = useState(2);
+  const [savedAreas, setSavedAreas] = useState<Area[]>([]);
+  const [areaNameInput, setAreaNameInput] = useState<string>("");
+  const [activeAreaId, setActiveAreaId] = useState<number | null>(null);
+  const [activeAreaName, setActiveAreaName] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string>(() => {
+    if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+      return crypto.randomUUID();
+    }
+    return `session_${Date.now()}`;
+  });
+  const sessionIdRef = useRef<string>(sessionId);
+  const [minConf, setMinConf] = useState(() => {
+    if (typeof window === "undefined") return 0.5;
+    const stored = window.localStorage.getItem("walkscan_minConf");
+    const value = stored ? Number(stored) : 0.5;
+    return Number.isFinite(value) ? value : 0.5;
+  });
+  const [maxArea, setMaxArea] = useState(() => {
+    if (typeof window === "undefined") return 0.85;
+    const stored = window.localStorage.getItem("walkscan_maxArea");
+    const value = stored ? Number(stored) : 0.85;
+    return Number.isFinite(value) ? value : 0.85;
+  });
+  const [minArea, setMinArea] = useState(() => {
+    if (typeof window === "undefined") return 0.03;
+    const stored = window.localStorage.getItem("walkscan_minArea");
+    const value = stored ? Number(stored) : 0.03;
+    return Number.isFinite(value) ? value : 0.03;
+  });
+  const [minStableHits, setMinStableHits] = useState(() => {
+    if (typeof window === "undefined") return 3;
+    const stored = window.localStorage.getItem("walkscan_minStableHits");
+    const value = stored ? Number(stored) : 3;
+    return Number.isFinite(value) ? value : 3;
+  });
+  const [imgsz, setImgsz] = useState(() => {
+    if (typeof window === "undefined") return 480;
+    const stored = window.localStorage.getItem("walkscan_imgsz");
+    const value = stored ? Number(stored) : 480;
+    return Number.isFinite(value) ? value : 480;
+  });
+  const [processEveryNFrames, setProcessEveryNFrames] = useState(1);
+  const [minAspect, setMinAspect] = useState(0.3);
+  const [maxAspect, setMaxAspect] = useState(3.5);
+  const [edgeMargin, setEdgeMargin] = useState(0.02);
+  const [captureCooldownSec, setCaptureCooldownSec] = useState(4);
+  const [lastApiInfo, setLastApiInfo] = useState<{
+    binsDetected: number;
+    latencyMs: number;
+    areaId: number | null;
+  } | null>(null);
 
   const syncCanvas = () => {
     const video = videoRef.current;
@@ -96,13 +150,13 @@ export default function WalkScanPage() {
         tracks.set(bestId, { id: bestId, bbox: det.bbox, lastSeen: Date.now() });
         const meta = trackMeta.get(bestId);
         const hits = meta && now - meta.lastSeen <= windowMs ? meta.hits + 1 : 1;
-        trackMeta.set(bestId, { hits, lastSeen: now });
+        trackMeta.set(bestId, { hits, lastSeen: now, lastCapture: meta?.lastCapture ?? 0 });
         updated.push({ ...det, track_id: bestId });
       } else {
         const newId = nextIdRef.current++;
         used.add(newId);
         tracks.set(newId, { id: newId, bbox: det.bbox, lastSeen: Date.now() });
-        trackMeta.set(newId, { hits: 1, lastSeen: now });
+        trackMeta.set(newId, { hits: 1, lastSeen: now, lastCapture: 0 });
         updated.push({ ...det, track_id: newId });
       }
     }
@@ -128,15 +182,67 @@ export default function WalkScanPage() {
       if (area > maxArea || area < minArea) return false;
       if (h === 0) return false;
       const ar = w / h;
-      if (ar < 0.3 || ar > 2.2) return false;
+      if (ar < minAspect || ar > maxAspect) return false;
       let edges = 0;
-      if (x1 < 0.01) edges += 1;
-      if (y1 < 0.01) edges += 1;
-      if (x2 > 0.99) edges += 1;
-      if (y2 > 0.99) edges += 1;
-      if (edges >= 3) return false;
+      if (x1 < edgeMargin) edges += 1;
+      if (y1 < edgeMargin) edges += 1;
+      if (x2 > 1 - edgeMargin) edges += 1;
+      if (y2 > 1 - edgeMargin) edges += 1;
+      if (edges >= 2) return false;
       return true;
     });
+  };
+
+  const generateSessionId = () => {
+    if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+      return crypto.randomUUID();
+    }
+    return `session_${Date.now()}`;
+  };
+
+  const applyActiveArea = (area: Area) => {
+    setActiveAreaId(area.id);
+    setActiveAreaName(area.name);
+    setAreaNameInput(area.name);
+    activeAreaIdRef.current = area.id;
+  };
+
+  const createOrGetArea = async (name: string) => {
+    const res = await fetch(`${API_BASE}/api/v1/areas`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    if (!res.ok) {
+      throw new Error("Failed to create area");
+    }
+    return (await res.json()) as Area;
+  };
+
+  const setArea = async () => {
+    const name = areaNameInput.trim();
+    if (!name) {
+      setError("Area name is required");
+      return;
+    }
+    try {
+      const area = await createOrGetArea(name);
+      applyActiveArea(area);
+      setSavedAreas((prev) => {
+        if (prev.find((a) => a.id === area.id)) return prev;
+        return [...prev, area].sort((a, b) => a.name.localeCompare(b.name));
+      });
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to set area");
+    }
+  };
+
+  const startNewSession = () => {
+    const newId = generateSessionId();
+    setSessionId(newId);
+    sessionIdRef.current = newId;
+    clearCaptures();
   };
 
   const drawOverlay = (items: Detection[]) => {
@@ -166,6 +272,10 @@ export default function WalkScanPage() {
 
   const captureFrame = async () => {
     if (inflightRef.current) return;
+    frameCounterRef.current += 1;
+    if (processEveryNFrames > 1 && frameCounterRef.current % processEveryNFrames !== 0) {
+      return;
+    }
     const video = videoRef.current;
     if (!video || video.videoWidth === 0 || video.videoHeight === 0) return;
     inflightRef.current = true;
@@ -191,16 +301,35 @@ export default function WalkScanPage() {
     }
 
     try {
+      const currentAreaId = activeAreaIdRef.current;
+      const currentSessionId = sessionIdRef.current;
+      if (!currentAreaId) {
+        setError("Set an area before scanning");
+        return;
+      }
       const formData = new FormData();
       formData.append("file", blob, "frame.jpg");
-      const res = await fetch(`${API_BASE}/api/v1/analyze-frame`, {
+      const query = new URLSearchParams({
+        session_id: currentSessionId,
+        area_id: String(currentAreaId),
+        imgsz: String(imgsz),
+        conf: String(minConf),
+      });
+      const start = performance.now();
+      const res = await fetch(`${API_BASE}/api/v1/analyze-frame?${query.toString()}`, {
         method: "POST",
         body: formData,
       });
+      const elapsed = performance.now() - start;
       if (!res.ok) {
         throw new Error("Analyze frame failed");
       }
       const data = await res.json();
+      setLastApiInfo({
+        binsDetected: Number(data.bins_detected || 0),
+        latencyMs: Math.round(elapsed),
+        areaId: currentAreaId,
+      });
       const filtered = filterDetections(data.detections || []);
       const tracked = assignTrackIds(filtered, fps);
       setDetections(tracked);
@@ -209,12 +338,43 @@ export default function WalkScanPage() {
       const thumbnail = offscreen.toDataURL("image/jpeg", 0.6);
       const newCaptures: CaptureItem[] = [];
       for (const det of tracked) {
-        if (!det.track_id || capturedIdsRef.current.has(det.track_id)) continue;
+        if (!det.track_id) continue;
         const meta = trackMetaRef.current.get(det.track_id);
         if (!meta || meta.hits < minStableHits) continue;
-        capturedIdsRef.current.add(det.track_id);
+        const now = Date.now();
+        if (meta.lastCapture && now - meta.lastCapture < captureCooldownSec * 1000) {
+          continue;
+        }
+        let captureId: number | undefined;
+        try {
+          const captureForm = new FormData();
+          captureForm.append("file", blob, `capture_${det.track_id}.jpg`);
+          captureForm.append("area_id", String(currentAreaId));
+          captureForm.append("session_id", currentSessionId);
+          captureForm.append("track_id", det.track_id.toString());
+          captureForm.append("status", det.fill_status);
+          captureForm.append("confidence", det.fill_conf.toString());
+          captureForm.append("detections_json", JSON.stringify(det));
+
+          const captureRes = await fetch(`${API_BASE}/api/v1/walkscan/capture`, {
+            method: "POST",
+            body: captureForm,
+          });
+          if (captureRes.ok) {
+            const captureData = await captureRes.json();
+            captureId = captureData.capture_id;
+            trackMetaRef.current.set(det.track_id, {
+              hits: meta.hits,
+              lastSeen: meta.lastSeen,
+              lastCapture: now,
+            });
+          }
+        } catch {
+          // Ignore capture storage errors, keep local capture
+        }
         newCaptures.push({
           id: det.track_id,
+          capture_id: captureId,
           timestamp: new Date().toISOString(),
           fill_status: det.fill_status,
           conf: det.fill_conf,
@@ -234,6 +394,9 @@ export default function WalkScanPage() {
 
   const startScan = async () => {
     try {
+      if (!activeAreaIdRef.current) {
+        throw new Error("Set an area before starting");
+      }
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "environment" },
         audio: false,
@@ -245,8 +408,9 @@ export default function WalkScanPage() {
       }
       syncCanvas();
       setRunning(true);
+      setError(null);
     } catch (err) {
-      setError("Camera permission denied");
+      setError(err instanceof Error ? err.message : "Camera permission denied");
     }
   };
 
@@ -266,19 +430,25 @@ export default function WalkScanPage() {
 
   const clearCaptures = () => {
     setCaptures([]);
-    capturedIdsRef.current.clear();
+    setDetections([]);
     tracksRef.current.clear();
     trackMetaRef.current.clear();
     nextIdRef.current = 1;
+    frameCounterRef.current = 0;
+    drawOverlay([]);
   };
 
   const exportJson = () => {
     const exportData = captures.map((c) => ({
       id: c.id,
+      capture_id: c.capture_id,
       timestamp: c.timestamp,
       fill_status: c.fill_status,
       conf: c.conf,
       bbox: c.bbox,
+      area_id: activeAreaId,
+      area_name: activeAreaName,
+      session_id: sessionId,
     }));
     const blob = new Blob([JSON.stringify(exportData, null, 2)], {
       type: "application/json",
@@ -298,7 +468,68 @@ export default function WalkScanPage() {
     return () => {
       window.clearInterval(interval);
     };
-  }, [running, fps]);
+  }, [
+    running,
+    fps,
+    processEveryNFrames,
+    minConf,
+    minArea,
+    maxArea,
+    minStableHits,
+    imgsz,
+    minAspect,
+    maxAspect,
+    edgeMargin,
+    captureCooldownSec,
+  ]);
+
+  useEffect(() => {
+    const loadAreas = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/v1/areas`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const list = (data.areas || []) as Area[];
+        setSavedAreas(list);
+      } catch {
+        // Ignore area fetch errors
+      }
+    };
+    loadAreas();
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem("walkscan_minConf", String(minConf));
+  }, [minConf]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem("walkscan_maxArea", String(maxArea));
+  }, [maxArea]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem("walkscan_minArea", String(minArea));
+  }, [minArea]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem("walkscan_minStableHits", String(minStableHits));
+  }, [minStableHits]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem("walkscan_imgsz", String(imgsz));
+  }, [imgsz]);
+
+  useEffect(() => {
+    sessionIdRef.current = sessionId;
+  }, [sessionId]);
+
+  useEffect(() => {
+    activeAreaIdRef.current = activeAreaId;
+  }, [activeAreaId]);
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -324,6 +555,82 @@ export default function WalkScanPage() {
       <main className="max-w-6xl mx-auto px-4 py-8 sm:px-6 lg:px-8">
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <div className="bg-white rounded-lg shadow-md p-4">
+            <div className="mb-4 rounded-lg border bg-gray-50 p-3 text-xs text-gray-600 space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  type="text"
+                  placeholder="Area name"
+                  value={areaNameInput}
+                  onChange={(e) => setAreaNameInput(e.target.value)}
+                  className="flex-1 min-w-[180px] border rounded px-2 py-1"
+                />
+                <button
+                  onClick={setArea}
+                  className="px-3 py-1 rounded bg-gray-800 text-white hover:bg-gray-900"
+                >
+                  Set Area
+                </button>
+                <button
+                  onClick={async () => {
+                    const name = areaNameInput.trim();
+                    if (!name) {
+                      setError("Area name is required");
+                      return;
+                    }
+                    try {
+                      const area = await createOrGetArea(name);
+                      applyActiveArea(area);
+                      setSavedAreas((prev) => {
+                        if (prev.find((a) => a.id === area.id)) return prev;
+                        return [...prev, area].sort((a, b) => a.name.localeCompare(b.name));
+                      });
+                      startNewSession();
+                      setError(null);
+                    } catch (err) {
+                      setError(err instanceof Error ? err.message : "Failed to set area");
+                    }
+                  }}
+                  className="px-3 py-1 rounded bg-gray-200 text-gray-700 hover:bg-gray-300"
+                >
+                  + New Session
+                </button>
+              </div>
+              <div className="flex items-center gap-2">
+                <span>Saved Areas</span>
+                <select
+                  value={activeAreaId ?? ""}
+                  onChange={(e) => {
+                    const id = Number(e.target.value);
+                    const selected = savedAreas.find((a) => a.id === id) || null;
+                    if (selected) {
+                      applyActiveArea(selected);
+                      startNewSession();
+                    } else {
+                      setActiveAreaId(null);
+                      setActiveAreaName(null);
+                      setAreaNameInput("");
+                      activeAreaIdRef.current = null;
+                      startNewSession();
+                    }
+                  }}
+                  className="border rounded px-2 py-1"
+                >
+                  <option value="">Select</option>
+                  {savedAreas.map((area) => (
+                    <option key={area.id} value={area.id}>
+                      {area.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                Active area:{" "}
+                <span className="font-semibold">{activeAreaName ?? "Not set"}</span>
+              </div>
+              <div>
+                Session ID: <span className="font-mono">{sessionId}</span>
+              </div>
+            </div>
             <div className="relative w-full aspect-video bg-black rounded-lg overflow-hidden">
               <video
                 ref={videoRef}
@@ -331,6 +638,12 @@ export default function WalkScanPage() {
                 className="absolute inset-0 w-full h-full object-cover"
               />
               <canvas ref={canvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
+            </div>
+            <div className="mt-2 text-xs text-gray-600">
+              Last API:{" "}
+              {lastApiInfo
+                ? `bins_detected=${lastApiInfo.binsDetected} latency=${lastApiInfo.latencyMs}ms area_id=${lastApiInfo.areaId}`
+                : "No requests yet"}
             </div>
             <div className="mt-4 flex flex-wrap gap-3 items-center">
               {!running ? (
@@ -371,10 +684,22 @@ export default function WalkScanPage() {
                   className="w-16 border rounded px-2 py-1"
                 />
               </div>
+              <div className="flex items-center gap-2 text-sm text-gray-600">
+                <span>Every N</span>
+                <select
+                  value={processEveryNFrames}
+                  onChange={(e) => setProcessEveryNFrames(Number(e.target.value))}
+                  className="border rounded px-2 py-1"
+                >
+                  <option value={1}>1</option>
+                  <option value={2}>2</option>
+                  <option value={3}>3</option>
+                </select>
+              </div>
             </div>
             <div className="mt-4 text-xs text-gray-600">
               <div className="font-semibold mb-2">Filters</div>
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+              <div className="grid grid-cols-2 md:grid-cols-7 gap-3">
                 <label className="flex flex-col gap-1">
                   <span>minConf</span>
                   <input
@@ -384,6 +709,18 @@ export default function WalkScanPage() {
                     onChange={(e) => setMinConf(Number(e.target.value))}
                     className="border rounded px-2 py-1"
                   />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span>Quality</span>
+                  <select
+                    value={imgsz}
+                    onChange={(e) => setImgsz(Number(e.target.value))}
+                    className="border rounded px-2 py-1"
+                  >
+                    <option value={320}>Fast</option>
+                    <option value={480}>Balanced</option>
+                    <option value={640}>Accurate</option>
+                  </select>
                 </label>
                 <label className="flex flex-col gap-1">
                   <span>maxArea</span>
@@ -406,6 +743,36 @@ export default function WalkScanPage() {
                   />
                 </label>
                 <label className="flex flex-col gap-1">
+                  <span>minAR</span>
+                  <input
+                    type="number"
+                    step="0.1"
+                    value={minAspect}
+                    onChange={(e) => setMinAspect(Number(e.target.value))}
+                    className="border rounded px-2 py-1"
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span>maxAR</span>
+                  <input
+                    type="number"
+                    step="0.1"
+                    value={maxAspect}
+                    onChange={(e) => setMaxAspect(Number(e.target.value))}
+                    className="border rounded px-2 py-1"
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span>edgeMargin</span>
+                  <input
+                    type="number"
+                    step="0.01"
+                    value={edgeMargin}
+                    onChange={(e) => setEdgeMargin(Number(e.target.value))}
+                    className="border rounded px-2 py-1"
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
                   <span>minStableHits</span>
                   <input
                     type="number"
@@ -413,6 +780,17 @@ export default function WalkScanPage() {
                     max={5}
                     value={minStableHits}
                     onChange={(e) => setMinStableHits(Number(e.target.value))}
+                    className="border rounded px-2 py-1"
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span>cooldown(s)</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={10}
+                    value={captureCooldownSec}
+                    onChange={(e) => setCaptureCooldownSec(Number(e.target.value))}
                     className="border rounded px-2 py-1"
                   />
                 </label>

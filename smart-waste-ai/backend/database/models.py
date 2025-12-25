@@ -191,6 +191,117 @@ class Artifact(Base):
         )
 
 
+class Area(Base):
+    """
+    Area table - grouping for walk scan sessions.
+    """
+    __tablename__ = "areas"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    bins: Mapped[List["Bin"]] = relationship(
+        "Bin",
+        back_populates="area",
+        cascade="all, delete-orphan",
+        lazy="selectin"
+    )
+
+    def __repr__(self) -> str:
+        return f"<Area(id={self.id}, name={self.name})>"
+
+
+class Bin(Base):
+    """
+    Bin table - stores deduplicated bins per area/session track.
+    """
+    __tablename__ = "bins"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    bin_key: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+
+    area_id: Mapped[int] = mapped_column(Integer, ForeignKey("areas.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    last_status: Mapped[Optional[str]] = mapped_column(SQLEnum(FillLevelEnum), nullable=True)
+    last_conf: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    capture_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    ops_status: Mapped[str] = mapped_column(String(20), nullable=False, default="NEW", index=True)
+    ops_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_false_positive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    priority_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0, index=True)
+    priority_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    area: Mapped["Area"] = relationship("Area", back_populates="bins")
+    captures: Mapped[List["Capture"]] = relationship(
+        "Capture",
+        back_populates="bin",
+        cascade="all, delete-orphan",
+        lazy="selectin"
+    )
+    events: Mapped[List["BinEvent"]] = relationship(
+        "BinEvent",
+        back_populates="bin",
+        cascade="all, delete-orphan",
+        lazy="selectin"
+    )
+
+    def __repr__(self) -> str:
+        return f"<Bin(id={self.id}, bin_key={self.bin_key})>"
+
+
+class Capture(Base):
+    """
+    Capture table - stores frames captured during walk scan.
+    """
+    __tablename__ = "captures"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    bin_id: Mapped[int] = mapped_column(Integer, ForeignKey("bins.id", ondelete="CASCADE"), nullable=False, index=True)
+    area_id: Mapped[int] = mapped_column(Integer, ForeignKey("areas.id", ondelete="CASCADE"), nullable=False, index=True)
+
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    image_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    thumb_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+
+    status: Mapped[str] = mapped_column(SQLEnum(FillLevelEnum), nullable=False)
+    conf: Mapped[float] = mapped_column(Float, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    extra_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    bin: Mapped["Bin"] = relationship("Bin", back_populates="captures")
+    area: Mapped["Area"] = relationship("Area")
+
+    def __repr__(self) -> str:
+        return f"<Capture(id={self.id}, bin_id={self.bin_id}, session_id={self.session_id})>"
+
+
+class BinEvent(Base):
+    """
+    BinEvent table - stores operational events for bins.
+    """
+    __tablename__ = "bin_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    bin_id: Mapped[int] = mapped_column(Integer, ForeignKey("bins.id", ondelete="CASCADE"), nullable=False, index=True)
+    event_type: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    from_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    to_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    bin: Mapped["Bin"] = relationship("Bin", back_populates="events")
+
+    def __repr__(self) -> str:
+        return f"<BinEvent(id={self.id}, bin_id={self.bin_id}, event_type={self.event_type})>"
+
+
 class BatchAnalysis(Base):
     """
     BatchAnalysis table - stores metadata for batch image uploads.

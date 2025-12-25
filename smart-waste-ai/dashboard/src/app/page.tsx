@@ -44,12 +44,25 @@ interface BinsResponse {
   timestamp: string;
 }
 
+interface DashboardArea {
+  area_id: number;
+  area_name: string;
+  bins_count: number;
+  captures_count: number;
+  max_priority: number;
+  last_seen: string | null;
+}
+
 export default function Home() {
   const [bins, setBins] = useState<BinStatus[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
   const [autoRefresh, setAutoRefresh] = useState<boolean>(true);
+  const [areas, setAreas] = useState<DashboardArea[]>([]);
+  const [areasError, setAreasError] = useState<string | null>(null);
+  const [areasLoading, setAreasLoading] = useState<boolean>(false);
+  const [areasToast, setAreasToast] = useState<string | null>(null);
 
   // Fetch bin status from API
   const fetchBinStatus = async () => {
@@ -71,9 +84,44 @@ export default function Home() {
     }
   };
 
+  const fetchAreas = async () => {
+    try {
+      setAreasError(null);
+      setAreasLoading(true);
+      const response = await fetch('http://localhost:8000/api/v1/dashboard/areas');
+      if (!response.ok) {
+        throw new Error(`API error: ${response.statusText}`);
+      }
+      const data = await response.json();
+      setAreas(data.areas || []);
+    } catch (err) {
+      setAreasError(err instanceof Error ? err.message : 'Failed to fetch areas');
+    } finally {
+      setAreasLoading(false);
+    }
+  };
+
+  const deleteArea = async (areaId: number) => {
+    if (!window.confirm("Delete area and all its bins/captures?")) return;
+    try {
+      const res = await fetch(`http://localhost:8000/api/v1/areas/${areaId}`, { method: "DELETE" });
+      if (!res.ok) throw new Error("Failed to delete area");
+      setAreasToast("Area deleted");
+      fetchAreas();
+    } catch (err) {
+      setAreasError(err instanceof Error ? err.message : "Failed to delete area");
+    }
+  };
+
   // Initial fetch
   useEffect(() => {
     fetchBinStatus();
+    fetchAreas();
+    const toastMsg = window.localStorage.getItem("areas_toast");
+    if (toastMsg) {
+      setAreasToast(toastMsg);
+      window.localStorage.removeItem("areas_toast");
+    }
   }, []);
 
   // Auto-refresh every 5 seconds
@@ -86,6 +134,13 @@ export default function Home() {
 
     return () => clearInterval(interval);
   }, [autoRefresh]);
+
+  useEffect(() => {
+    if (!areasToast) return;
+    const timer = setTimeout(() => setAreasToast(null), 2500);
+    return () => clearTimeout(timer);
+  }, [areasToast]);
+
 
   // Get fill level color
   const getFillLevelColor = (level: string): string => {
@@ -149,6 +204,12 @@ export default function Home() {
                 className="px-4 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-700 transition"
               >
                 Walk Scan
+              </Link>
+              <Link
+                href="/bins"
+                className="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition"
+              >
+                Bins
               </Link>
               <Link
                 href="/train"
@@ -297,6 +358,66 @@ export default function Home() {
             ))}
           </div>
         )}
+
+        <section className="mt-12">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-2xl font-semibold text-gray-900">Areas</h2>
+            <button
+              onClick={fetchAreas}
+              className="text-sm text-blue-600 hover:underline"
+            >
+              Refresh
+            </button>
+          </div>
+
+          {areasError && (
+            <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-4">
+              <p className="text-red-800">Error: {areasError}</p>
+            </div>
+          )}
+          {areasToast && (
+            <div className="bg-green-50 border border-green-200 rounded-lg p-4 mb-4">
+              <p className="text-green-800">{areasToast}</p>
+            </div>
+          )}
+
+          {areasLoading && (
+            <div className="text-sm text-gray-500 mb-4">Loading areas...</div>
+          )}
+
+          <div className="space-y-3">
+            {areas.map((area) => (
+              <div key={area.area_id} className="bg-white rounded-lg shadow-sm border p-3 flex flex-col md:flex-row gap-4">
+                <div className="flex-1 text-xs text-gray-700 space-y-1">
+                  <div className="text-sm font-semibold">{area.area_name}</div>
+                  <div>Bins: {area.bins_count}</div>
+                  <div>Captures: {area.captures_count}</div>
+                  <div>Max priority: {area.max_priority.toFixed(0)}</div>
+                  <div className="text-gray-500">
+                    Last seen: {area.last_seen ? new Date(area.last_seen).toLocaleString() : "-"}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Link
+                    href={`/areas/${area.area_id}`}
+                    className="px-3 py-1 rounded bg-gray-200 text-gray-700 hover:bg-gray-300"
+                  >
+                    Open
+                  </Link>
+                  <button
+                    onClick={() => deleteArea(area.area_id)}
+                    className="px-3 py-1 rounded bg-red-100 text-red-700 hover:bg-red-200"
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+            ))}
+            {areas.length === 0 && !areasLoading && (
+              <div className="text-sm text-gray-500">No areas yet.</div>
+            )}
+          </div>
+        </section>
       </main>
 
       {/* Footer */}

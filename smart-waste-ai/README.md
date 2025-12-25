@@ -119,6 +119,9 @@ cd smart-waste-ai
 
 # OR start in local development mode (uses SQLite)
 ./run.sh start local
+
+# OR start local walkscan mode (runs migrations first)
+./run.sh start walkscan
 ```
 
 **Access points:**
@@ -306,12 +309,116 @@ Controls:
 - Start/Stop camera
 - Clear captured bins
 - Export JSON of captured bins
+- Quality selector (Fast/Balanced/Accurate)
+
+### Areas (Required)
+
+1) Enter an **Area name** and click **Set Area**.
+2) Start the camera. All captures are grouped under the active area.
+3) Use **+ New Session** to reset tracking and start a fresh run.
+4) Areas can be deleted from the dashboard (this removes all bins/captures under the area).
+
+### Admin Workflow (Dashboard)
+
+The main dashboard shows **Areas** (one row per area). Open an area to browse bins and update operational status:
+
+- Dashboard → Areas → Open → `/areas/<id>`
+
+- `NEW` → default when first captured
+- `ON_PROCESS` → admin acknowledged
+- `TRUCK_SENT` → truck assigned
+- `EMPTIED` → cleared
+- `CLOSED` → false positive / ignored
+
+### Priority Scoring
+
+Priority is computed automatically when captures or status change:
+
+- `FULL` = 100, `HALF` = 60, `EMPTY` = 20
+- + `round(fill_conf * 20)`
+- + `min(capture_count * 2, 20)`
+- `ON_PROCESS` = -10, `TRUCK_SENT` = -20
+- `EMPTIED`/`CLOSED` = 0
+
+### Export per Area
+
+Use the dashboard **Export Area** button or call the API:
+
+```
+GET /api/v1/areas/{area_id}/export?format=json|csv
+```
+
+### Delete a Bin
+
+```
+DELETE /api/v1/bins/{bin_id}
+```
+
+### Delete an Area
+
+```
+DELETE /api/v1/areas/{area_id}
+```
+
+### Hard Negatives (False Positives)
+
+When a bin is marked false positive, the latest capture is saved to:
+
+```
+data/training/hard_negatives/<area>/<timestamp>_<bin_id>.jpg
+```
 
 ### Backend API (single frame)
 
 ```bash
 curl -sS -X POST "http://localhost:8000/api/v1/analyze-frame" \
-  -F "file=@/path/to/frame.jpg" | python3 -m json.tool
+  -F "file=@/path/to/frame.jpg" \
+  -F "area_id=1" | python3 -m json.tool
+```
+
+### Backend API (capture)
+
+```bash
+./scripts/test_capture.sh /path/to/frame.jpg [area_id]
+```
+
+### Curl Examples (Areas + Admin)
+
+```bash
+# 1) Create/get area
+curl -sS -X POST "http://localhost:8000/api/v1/areas" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Downtown"}' | python3 -m json.tool
+
+# 1b) Create/get area (form-data)
+curl -sS -X POST "http://localhost:8000/api/v1/areas" \
+  -F "name=Downtown" | python3 -m json.tool
+
+# 2) Analyze frame with area_id
+curl -sS -X POST "http://localhost:8000/api/v1/analyze-frame" \
+  -F "file=@/path/to/frame.jpg" \
+  -F "area_id=1" | python3 -m json.tool
+
+# 3) List dashboard bins sorted by priority
+curl -sS "http://localhost:8000/api/v1/dashboard/bins" | python3 -m json.tool
+
+# 4) Patch bin status
+curl -sS -X PATCH "http://localhost:8000/api/v1/bins/1" \
+  -H "Content-Type: application/json" \
+  -d '{"ops_status":"ON_PROCESS"}' | python3 -m json.tool
+
+# 5) Mark false positive
+curl -sS -X POST "http://localhost:8000/api/v1/bins/1/false-positive" \
+  -H "Content-Type: application/json" \
+  -d '{"note":"Not a real bin"}' | python3 -m json.tool
+
+# 6) Export area JSON/CSV
+curl -sS "http://localhost:8000/api/v1/areas/1/export?format=json" | python3 -m json.tool
+curl -sS "http://localhost:8000/api/v1/areas/1/export?format=csv" -o area_1_bins.csv
+
+# 7) Delete bin / area
+curl -sS -X DELETE "http://localhost:8000/api/v1/bins/1"
+curl -sS -X DELETE "http://localhost:8000/api/v1/areas/1"
 ```
 
 #### Option B: Using cURL

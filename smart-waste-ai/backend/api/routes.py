@@ -12,6 +12,8 @@ Endpoints:
 - POST /clear-cache         - Clear bin status cache
 """
 
+import csv
+import io
 import logging
 import re
 import tempfile
@@ -21,10 +23,10 @@ import uuid
 from datetime import datetime
 from typing import Optional, List, Dict
 from fastapi import APIRouter, HTTPException, status, UploadFile, File, Depends, Query, Form, Request
-from fastapi.responses import FileResponse
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pathlib import Path
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 from backend.schemas.bin_status import (
     BinStatusResponse,
@@ -39,6 +41,7 @@ from backend.services.inference_service import get_inference_service
 from backend.services import training_service
 from backend.database.session import get_db, check_db_connection
 from backend.services.analysis_service import AnalysisService
+from backend.database.models import Area as AreaModel, Bin as BinModel, Capture as CaptureModel, BinEvent as BinEventModel, FillLevelEnum as DbFillLevelEnum
 from backend.config import config as backend_config
 from ai.config import config
 from pydantic import BaseModel
@@ -76,6 +79,95 @@ class UseModelRequest(BaseModel):
     weights_path: str
 
 
+class BinUpdateRequest(BaseModel):
+    ops_status: Optional[str] = None
+    ops_notes: Optional[str] = None
+
+
+class FalsePositiveRequest(BaseModel):
+    note: Optional[str] = None
+
+
+OPS_STATUS_VALUES = {
+    "NEW",
+    "REPORTED",
+    "ON_PROCESS",
+    "TRUCK_SENT",
+    "EMPTIED",
+    "CLOSED",
+    "RESOLVED",
+}
+
+
+def _compute_priority(status: str, conf: float, capture_count: int, ops_status: str) -> tuple[float, str]:
+    base_map = {"FULL": 100, "HALF": 60, "EMPTY": 20}
+    if ops_status in {"EMPTIED", "CLOSED"}:
+        return 0.0, f"{ops_status} => 0"
+    base = base_map.get(status, 20)
+    score = base + round(conf * 20) + min(capture_count * 2, 20)
+    if ops_status == "ON_PROCESS":
+        score -= 10
+    if ops_status == "TRUCK_SENT":
+        score -= 20
+    score = max(score, 0)
+    reason = f"{status} + conf + repeats"
+    if ops_status in {"ON_PROCESS", "TRUCK_SENT"}:
+        reason += f" - {ops_status}"
+    return score, reason
+
+
+def _record_event(
+    db: Session,
+    bin_id: int,
+    event_type: str,
+    from_status: Optional[str] = None,
+    to_status: Optional[str] = None,
+    note: Optional[str] = None,
+) -> None:
+    event = BinEventModel(
+        bin_id=bin_id,
+        event_type=event_type,
+        from_status=from_status,
+        to_status=to_status,
+        note=note,
+    )
+    db.add(event)
+
+
+def _update_bin_priority(bin_record: BinModel) -> None:
+    status = bin_record.last_status or "EMPTY"
+    conf = float(bin_record.last_conf or 0.0)
+    capture_count = int(bin_record.capture_count or 0)
+    ops_status = bin_record.ops_status or "NEW"
+    score, reason = _compute_priority(status, conf, capture_count, ops_status)
+    bin_record.priority_score = score
+    bin_record.priority_reason = reason
+
+
+def _capture_image_response(capture: CaptureModel) -> FileResponse:
+    image_path = (backend_config.CAPTURES_DIR / capture.image_path).resolve()
+    captures_root = backend_config.CAPTURES_DIR.resolve()
+    if not str(image_path).startswith(str(captures_root)):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid capture path")
+    if not image_path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
+    return FileResponse(str(image_path))
+
+
+def _delete_bin_with_assets(db: Session, bin_record: BinModel) -> None:
+    captures = db.query(CaptureModel).filter(CaptureModel.bin_id == bin_record.id).all()
+    captures_root = backend_config.CAPTURES_DIR.resolve()
+    for capture in captures:
+        image_path = (backend_config.CAPTURES_DIR / capture.image_path).resolve()
+        if str(image_path).startswith(str(captures_root)) and image_path.exists():
+            try:
+                image_path.unlink()
+            except Exception as e:
+                logger.warning(f"Failed to delete capture image: {e}")
+
+    db.query(CaptureModel).filter(CaptureModel.bin_id == bin_record.id).delete(synchronize_session=False)
+    db.query(BinEventModel).filter(BinEventModel.bin_id == bin_record.id).delete(synchronize_session=False)
+    db.delete(bin_record)
 @router.get(
     "/health",
     response_model=HealthCheckResponse,
@@ -734,9 +826,14 @@ async def analyze_upload(
     description="Analyze a single video frame for bin detections"
 )
 async def analyze_frame(
+    request: Request,
     file: UploadFile = File(...),
     save: bool = Query(False),
-    session_id: Optional[str] = Query(None)
+    session_id: Optional[str] = Query(None),
+    area_id: Optional[int] = Form(None),
+    imgsz: Optional[int] = Form(None),
+    conf: Optional[float] = Form(None),
+    db: Session = Depends(get_db)
 ):
     try:
         service = get_inference_service()
@@ -758,7 +855,58 @@ async def analyze_frame(
                 detail="Failed to decode image"
             )
 
-        detections = service.pipeline.detector.detect(image)
+        area_id_value = area_id
+        imgsz_value = imgsz
+        conf_value = conf
+        if area_id_value is None and request is not None:
+            query_value = request.query_params.get("area_id")
+            if query_value:
+                try:
+                    area_id_value = int(query_value)
+                except ValueError:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid area_id")
+        if imgsz_value is None and request is not None:
+            query_value = request.query_params.get("imgsz")
+            if query_value:
+                imgsz_value = query_value
+        if conf_value is None and request is not None:
+            query_value = request.query_params.get("conf")
+            if query_value:
+                conf_value = query_value
+
+        if area_id_value is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="area_id is required")
+
+        area = db.query(AreaModel).filter(AreaModel.id == area_id_value).first()
+        if not area:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Area not found")
+
+        imgsz_value = imgsz_value or getattr(config, "YOLO_IMAGE_SIZE", 640)
+        try:
+            imgsz_value = int(imgsz_value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid imgsz")
+        if imgsz_value <= 0:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid imgsz")
+
+        if conf_value is not None:
+            try:
+                conf_value = float(conf_value)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid conf")
+            if conf_value < 0 or conf_value > 1:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid conf")
+
+        original_imgsz = config.YOLO_IMAGE_SIZE
+        if imgsz_value != original_imgsz:
+            config.YOLO_IMAGE_SIZE = imgsz_value
+        try:
+            detections = service.pipeline.detector.detect(
+                image,
+                confidence_threshold=conf_value,
+            )
+        finally:
+            config.YOLO_IMAGE_SIZE = original_imgsz
         if not detections:
             return {
                 "detections": [],
@@ -832,6 +980,735 @@ async def analyze_frame(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Analyze frame failed: {str(e)}"
         )
+
+
+@router.post(
+    "/areas",
+    summary="Create or Get Area",
+    description="Create an area or return existing area by name"
+)
+async def create_or_get_area(request: Request, db: Session = Depends(get_db)):
+    content_type = request.headers.get("content-type", "")
+    payload = {}
+    if "application/json" in content_type:
+        payload = await request.json()
+    else:
+        form = await request.form()
+        payload = dict(form)
+
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Area name is required")
+
+    normalized = name.lower()
+    area = (
+        db.query(AreaModel)
+        .filter(func.lower(AreaModel.name) == normalized)
+        .first()
+    )
+    if not area:
+        now = datetime.utcnow()
+        area = AreaModel(name=name, created_at=now, updated_at=now)
+        db.add(area)
+        db.commit()
+        db.refresh(area)
+    return {"id": area.id, "name": area.name}
+
+
+@router.get(
+    "/areas",
+    summary="List Areas",
+    description="List all configured areas"
+)
+async def list_areas(db: Session = Depends(get_db)):
+    areas = db.query(AreaModel).order_by(AreaModel.name.asc()).all()
+    return {"areas": [{"id": a.id, "name": a.name} for a in areas]}
+
+
+@router.delete(
+    "/areas/{area_id}",
+    summary="Delete Area",
+    description="Delete an area and all related bins/captures"
+)
+async def delete_area(area_id: int, db: Session = Depends(get_db)):
+    area = db.query(AreaModel).filter(AreaModel.id == area_id).first()
+    if not area:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Area not found")
+
+    bins = db.query(BinModel).filter(BinModel.area_id == area_id).all()
+    try:
+        for bin_record in bins:
+            _delete_bin_with_assets(db, bin_record)
+        db.delete(area)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to delete area {area_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to delete area")
+
+    return {"ok": True}
+
+
+@router.post(
+    "/walkscan/capture",
+    summary="Store Walk Scan Capture",
+    description="Store a walk scan capture with area/session metadata"
+)
+async def walkscan_capture(
+    file: UploadFile = File(...),
+    area_id: int = Form(...),
+    session_id: str = Form(...),
+    track_id: int = Form(...),
+    status: str = Form(...),
+    confidence: float = Form(...),
+    detections_json: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    if status not in {e.value for e in DbFillLevelEnum}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid status")
+
+    area = db.query(AreaModel).filter(AreaModel.id == area_id).first()
+    if not area:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Area not found")
+
+    session_dir = backend_config.CAPTURES_DIR / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    capture_id = uuid.uuid4().hex[:8]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    image_name = f"{timestamp}_{capture_id}.jpg"
+    image_path = session_dir / image_name
+
+    contents = await file.read()
+    with open(image_path, "wb") as f:
+        f.write(contents)
+
+    bin_key = f"{area_id}:{session_id}:{track_id}"
+    bin_record = db.query(BinModel).filter(BinModel.bin_key == bin_key).first()
+    if not bin_record:
+        bin_record = BinModel(
+            bin_key=bin_key,
+            area_id=area_id,
+            last_status=status,
+            last_conf=confidence,
+            capture_count=0,
+        )
+        db.add(bin_record)
+        db.flush()
+
+    capture = CaptureModel(
+        bin_id=bin_record.id,
+        area_id=area_id,
+        session_id=session_id,
+        image_path=str(Path(session_id) / image_name),
+        status=status,
+        conf=confidence,
+        extra_json=detections_json,
+    )
+    db.add(capture)
+
+    bin_record.last_status = status
+    bin_record.last_conf = confidence
+    bin_record.capture_count = (bin_record.capture_count or 0) + 1
+    bin_record.updated_at = datetime.utcnow()
+    bin_record.last_seen_at = datetime.utcnow()
+    if not bin_record.ops_status:
+        bin_record.ops_status = "NEW"
+    _update_bin_priority(bin_record)
+
+    _record_event(db, bin_record.id, "CAPTURE_ADDED", note="Walk scan capture added")
+
+    db.commit()
+
+    return {
+        "bin_id": bin_record.id,
+        "bin_key": bin_record.bin_key,
+        "capture_id": capture.id,
+        "saved_path": str(Path(session_id) / image_name),
+        "area": {"id": area.id, "name": area.name},
+        "status": status,
+        "confidence": confidence,
+    }
+
+
+@router.get(
+    "/walkscan/bins",
+    summary="List Walk Scan Bins",
+    description="List deduplicated bins with capture counts"
+)
+async def walkscan_bins(db: Session = Depends(get_db)):
+    bins = db.query(BinModel).order_by(BinModel.updated_at.desc()).all()
+    return {
+        "bins": [
+            {
+                "id": b.id,
+                "bin_key": b.bin_key,
+                "area": {"id": b.area.id, "name": b.area.name} if b.area else None,
+                "last_status": b.last_status,
+                "last_conf": b.last_conf,
+                "capture_count": b.capture_count,
+                "ops_status": b.ops_status,
+                "priority_score": b.priority_score,
+                "last_seen_at": b.last_seen_at.isoformat() if b.last_seen_at else None,
+                "updated_at": b.updated_at.isoformat(),
+            }
+            for b in bins
+        ]
+    }
+
+
+@router.get(
+    "/walkscan/bins/{bin_id}",
+    summary="Get Walk Scan Bin Detail",
+    description="Get bin detail with captures"
+)
+async def walkscan_bin_detail(bin_id: int, db: Session = Depends(get_db)):
+    bin_record = db.query(BinModel).filter(BinModel.id == bin_id).first()
+    if not bin_record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bin not found")
+    captures = (
+        db.query(CaptureModel)
+        .filter(CaptureModel.bin_id == bin_id)
+        .order_by(CaptureModel.created_at.desc())
+        .all()
+    )
+    return {
+        "id": bin_record.id,
+        "bin_key": bin_record.bin_key,
+        "area": {"id": bin_record.area.id, "name": bin_record.area.name} if bin_record.area else None,
+        "last_status": bin_record.last_status,
+        "last_conf": bin_record.last_conf,
+        "capture_count": bin_record.capture_count,
+        "ops_status": bin_record.ops_status,
+        "priority_score": bin_record.priority_score,
+        "priority_reason": bin_record.priority_reason,
+        "last_seen_at": bin_record.last_seen_at.isoformat() if bin_record.last_seen_at else None,
+        "updated_at": bin_record.updated_at.isoformat(),
+        "captures": [
+            {
+                "id": c.id,
+                "session_id": c.session_id,
+                "image_path": c.image_path,
+                "status": c.status,
+                "conf": c.conf,
+                "image_url": f"/api/v1/captures/{c.id}/image",
+                "created_at": c.created_at.isoformat(),
+            }
+            for c in captures
+        ],
+    }
+
+
+@router.get(
+    "/walkscan/captures/{capture_id}/image",
+    summary="Get Capture Image",
+    description="Serve capture image by capture id"
+)
+async def walkscan_capture_image(capture_id: int, db: Session = Depends(get_db)):
+    capture = db.query(CaptureModel).filter(CaptureModel.id == capture_id).first()
+    if not capture:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Capture not found")
+    return _capture_image_response(capture)
+
+
+@router.get(
+    "/captures/{capture_id}/image",
+    summary="Get Capture Image",
+    description="Serve capture image by capture id"
+)
+async def capture_image(capture_id: int, db: Session = Depends(get_db)):
+    capture = db.query(CaptureModel).filter(CaptureModel.id == capture_id).first()
+    if not capture:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Capture not found")
+    return _capture_image_response(capture)
+
+
+@router.get(
+    "/bins",
+    summary="List Bins",
+    description="List bins with optional area filter"
+)
+async def list_bins(
+    area_id: Optional[int] = Query(None),
+    db: Session = Depends(get_db)
+):
+    query = db.query(BinModel)
+    if area_id is not None:
+        query = query.filter(BinModel.area_id == area_id)
+    bins = query.order_by(BinModel.updated_at.desc()).all()
+
+    items = []
+    for b in bins:
+        latest_capture = (
+            db.query(CaptureModel)
+            .filter(CaptureModel.bin_id == b.id)
+            .order_by(CaptureModel.created_at.desc())
+            .first()
+        )
+        items.append(
+            {
+                "id": b.id,
+                "bin_key": b.bin_key,
+                "area": {"id": b.area.id, "name": b.area.name} if b.area else None,
+                "last_status": b.last_status,
+                "last_conf": b.last_conf,
+                "capture_count": b.capture_count,
+                "ops_status": b.ops_status,
+                "priority_score": b.priority_score,
+                "priority_reason": b.priority_reason,
+                "last_seen_at": b.last_seen_at.isoformat() if b.last_seen_at else None,
+                "updated_at": b.updated_at.isoformat(),
+                "thumbnail_url": f"/api/v1/captures/{latest_capture.id}/image" if latest_capture else None,
+            }
+        )
+
+    return {"bins": items}
+
+
+@router.get(
+    "/bins/{bin_id}",
+    summary="Get Bin Detail",
+    description="Get bin detail with captures"
+)
+async def get_bin_detail(bin_id: int, db: Session = Depends(get_db)):
+    bin_record = db.query(BinModel).filter(BinModel.id == bin_id).first()
+    if not bin_record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bin not found")
+    captures = (
+        db.query(CaptureModel)
+        .filter(CaptureModel.bin_id == bin_id)
+        .order_by(CaptureModel.created_at.desc())
+        .all()
+    )
+    return {
+        "id": bin_record.id,
+        "bin_key": bin_record.bin_key,
+        "area": {"id": bin_record.area.id, "name": bin_record.area.name} if bin_record.area else None,
+        "last_status": bin_record.last_status,
+        "last_conf": bin_record.last_conf,
+        "capture_count": bin_record.capture_count,
+        "ops_status": bin_record.ops_status,
+        "ops_notes": bin_record.ops_notes,
+        "is_false_positive": bin_record.is_false_positive,
+        "priority_score": bin_record.priority_score,
+        "priority_reason": bin_record.priority_reason,
+        "last_seen_at": bin_record.last_seen_at.isoformat() if bin_record.last_seen_at else None,
+        "updated_at": bin_record.updated_at.isoformat(),
+        "captures": [
+            {
+                "id": c.id,
+                "session_id": c.session_id,
+                "image_path": c.image_path,
+                "image_url": f"/api/v1/captures/{c.id}/image",
+                "status": c.status,
+                "conf": c.conf,
+                "created_at": c.created_at.isoformat(),
+            }
+            for c in captures
+        ],
+    }
+
+
+@router.get(
+    "/bins/{bin_id}/captures",
+    summary="List Bin Captures",
+    description="List captures for a bin"
+)
+async def list_bin_captures(bin_id: int, db: Session = Depends(get_db)):
+    bin_record = db.query(BinModel).filter(BinModel.id == bin_id).first()
+    if not bin_record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bin not found")
+    captures = (
+        db.query(CaptureModel)
+        .filter(CaptureModel.bin_id == bin_id)
+        .order_by(CaptureModel.created_at.desc())
+        .all()
+    )
+    return {
+        "captures": [
+            {
+                "id": c.id,
+                "session_id": c.session_id,
+                "image_path": c.image_path,
+                "image_url": f"/api/v1/captures/{c.id}/image",
+                "status": c.status,
+                "conf": c.conf,
+                "created_at": c.created_at.isoformat(),
+            }
+            for c in captures
+        ]
+    }
+
+
+@router.get(
+    "/bins/{bin_id}/events",
+    summary="List Bin Events",
+    description="List operational events for a bin"
+)
+async def list_bin_events(bin_id: int, db: Session = Depends(get_db)):
+    bin_record = db.query(BinModel).filter(BinModel.id == bin_id).first()
+    if not bin_record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bin not found")
+    events = (
+        db.query(BinEventModel)
+        .filter(BinEventModel.bin_id == bin_id)
+        .order_by(BinEventModel.created_at.desc())
+        .all()
+    )
+    return {
+        "events": [
+            {
+                "id": e.id,
+                "event_type": e.event_type,
+                "from_status": e.from_status,
+                "to_status": e.to_status,
+                "note": e.note,
+                "created_at": e.created_at.isoformat(),
+            }
+            for e in events
+        ]
+    }
+
+
+@router.patch(
+    "/bins/{bin_id}",
+    summary="Update Bin Ops Status",
+    description="Update operational status or notes for a bin"
+)
+async def update_bin(bin_id: int, request: BinUpdateRequest, db: Session = Depends(get_db)):
+    bin_record = db.query(BinModel).filter(BinModel.id == bin_id).first()
+    if not bin_record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bin not found")
+
+    now = datetime.utcnow()
+    ops_status = request.ops_status
+    ops_notes = request.ops_notes
+    status_changed = False
+
+    if ops_status is not None:
+        if ops_status not in OPS_STATUS_VALUES:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid ops_status")
+        if ops_status != bin_record.ops_status:
+            _record_event(
+                db,
+                bin_record.id,
+                "STATUS_CHANGE",
+                from_status=bin_record.ops_status,
+                to_status=ops_status,
+            )
+            bin_record.ops_status = ops_status
+            status_changed = True
+
+    if ops_notes is not None:
+        bin_record.ops_notes = ops_notes
+        if ops_notes.strip():
+            _record_event(db, bin_record.id, "NOTE", note=ops_notes.strip())
+
+    if status_changed or ops_notes is not None:
+        bin_record.updated_at = now
+        _update_bin_priority(bin_record)
+        db.commit()
+        db.refresh(bin_record)
+
+    return {
+        "id": bin_record.id,
+        "ops_status": bin_record.ops_status,
+        "ops_notes": bin_record.ops_notes,
+        "priority_score": bin_record.priority_score,
+        "priority_reason": bin_record.priority_reason,
+        "updated_at": bin_record.updated_at.isoformat(),
+    }
+
+
+@router.post(
+    "/bins/{bin_id}/false-positive",
+    summary="Mark Bin as False Positive",
+    description="Mark bin as false positive and close it"
+)
+async def mark_false_positive(bin_id: int, request: FalsePositiveRequest, db: Session = Depends(get_db)):
+    bin_record = db.query(BinModel).filter(BinModel.id == bin_id).first()
+    if not bin_record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bin not found")
+
+    note = request.note.strip() if request.note else None
+    old_status = bin_record.ops_status
+    bin_record.ops_status = "CLOSED"
+    bin_record.is_false_positive = True
+    if note:
+        bin_record.ops_notes = note
+    bin_record.updated_at = datetime.utcnow()
+
+    _record_event(
+        db,
+        bin_record.id,
+        "MARK_FALSE_POSITIVE",
+        from_status=old_status,
+        to_status="CLOSED",
+        note=note,
+    )
+    _update_bin_priority(bin_record)
+    db.commit()
+
+    hard_negative_saved = False
+    hard_negative_path = None
+    latest_capture = (
+        db.query(CaptureModel)
+        .filter(CaptureModel.bin_id == bin_record.id)
+        .order_by(CaptureModel.created_at.desc())
+        .first()
+    )
+    if latest_capture:
+        source_path = (backend_config.CAPTURES_DIR / latest_capture.image_path).resolve()
+        captures_root = backend_config.CAPTURES_DIR.resolve()
+        if str(source_path).startswith(str(captures_root)) and source_path.exists():
+            area_name = bin_record.area.name if bin_record.area else f"area_{bin_record.area_id}"
+            safe_area = re.sub(r"[^A-Za-z0-9_-]+", "_", area_name.strip()) or f"area_{bin_record.area_id}"
+            target_dir = backend_config.TRAINING_DIR / "hard_negatives" / safe_area
+            target_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+            target_name = f"{timestamp}_{bin_record.id}.jpg"
+            target_path = target_dir / target_name
+            try:
+                shutil.copyfile(source_path, target_path)
+                hard_negative_saved = True
+                hard_negative_path = str(target_path)
+            except Exception as e:
+                logger.warning(f"Failed to save hard negative: {e}")
+
+    return {
+        "id": bin_record.id,
+        "ops_status": bin_record.ops_status,
+        "is_false_positive": bin_record.is_false_positive,
+        "priority_score": bin_record.priority_score,
+        "updated_at": bin_record.updated_at.isoformat(),
+        "hard_negative_saved": hard_negative_saved,
+        "hard_negative_path": hard_negative_path,
+    }
+
+
+@router.delete(
+    "/bins/{bin_id}",
+    summary="Delete Bin",
+    description="Delete a bin and all related captures/events"
+)
+async def delete_bin(bin_id: int, db: Session = Depends(get_db)):
+    bin_record = db.query(BinModel).filter(BinModel.id == bin_id).first()
+    if not bin_record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bin not found")
+
+    try:
+        _delete_bin_with_assets(db, bin_record)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to delete bin {bin_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to delete bin")
+
+    return {"ok": True}
+
+
+@router.get(
+    "/dashboard/bins",
+    summary="List Bins for Dashboard",
+    description="List bins with filters for admin dashboard"
+)
+async def dashboard_bins(
+    area_id: Optional[int] = Query(None),
+    ops_status: Optional[str] = Query(None),
+    min_priority: Optional[float] = Query(None),
+    sort: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    query = db.query(BinModel)
+    if area_id is not None:
+        query = query.filter(BinModel.area_id == area_id)
+    if ops_status:
+        query = query.filter(BinModel.ops_status == ops_status)
+    if min_priority is not None:
+        query = query.filter(BinModel.priority_score >= min_priority)
+
+    total = query.count()
+    if sort == "updated_desc":
+        query = query.order_by(BinModel.updated_at.desc())
+    else:
+        query = query.order_by(BinModel.priority_score.desc(), BinModel.updated_at.desc())
+
+    bins = query.offset(offset).limit(limit).all()
+    results = []
+    for b in bins:
+        latest_capture = (
+            db.query(CaptureModel)
+            .filter(CaptureModel.bin_id == b.id)
+            .order_by(CaptureModel.created_at.desc())
+            .first()
+        )
+        results.append(
+            {
+                "id": b.id,
+                "bin_key": b.bin_key,
+                "area": {"id": b.area.id, "name": b.area.name} if b.area else None,
+                "capture_count": b.capture_count,
+                "last_status": b.last_status,
+                "last_conf": b.last_conf,
+                "ops_status": b.ops_status,
+                "last_seen_at": b.last_seen_at.isoformat() if b.last_seen_at else None,
+                "updated_at": b.updated_at.isoformat(),
+                "priority_score": b.priority_score,
+                "priority_reason": b.priority_reason,
+                "thumbnail_url": f"/api/v1/captures/{latest_capture.id}/image" if latest_capture else None,
+            }
+        )
+
+    return {"bins": results, "total": total}
+
+
+@router.get(
+    "/dashboard/areas",
+    summary="List Areas for Dashboard",
+    description="Aggregate areas with bin/capture counts"
+)
+async def dashboard_areas(db: Session = Depends(get_db)):
+    bins_sub = (
+        db.query(
+            BinModel.area_id.label("area_id"),
+            func.count(BinModel.id).label("bins_count"),
+            func.max(BinModel.priority_score).label("max_priority"),
+            func.max(BinModel.last_seen_at).label("last_seen"),
+        )
+        .group_by(BinModel.area_id)
+        .subquery()
+    )
+    captures_sub = (
+        db.query(
+            CaptureModel.area_id.label("area_id"),
+            func.count(CaptureModel.id).label("captures_count"),
+        )
+        .group_by(CaptureModel.area_id)
+        .subquery()
+    )
+
+    rows = (
+        db.query(
+            AreaModel.id.label("area_id"),
+            AreaModel.name.label("area_name"),
+            func.coalesce(bins_sub.c.bins_count, 0).label("bins_count"),
+            func.coalesce(captures_sub.c.captures_count, 0).label("captures_count"),
+            func.coalesce(bins_sub.c.max_priority, 0.0).label("max_priority"),
+            bins_sub.c.last_seen.label("last_seen"),
+        )
+        .outerjoin(bins_sub, bins_sub.c.area_id == AreaModel.id)
+        .outerjoin(captures_sub, captures_sub.c.area_id == AreaModel.id)
+        .order_by(AreaModel.name.asc())
+        .all()
+    )
+
+    return {
+        "areas": [
+            {
+                "area_id": row.area_id,
+                "area_name": row.area_name,
+                "bins_count": int(row.bins_count or 0),
+                "captures_count": int(row.captures_count or 0),
+                "max_priority": float(row.max_priority or 0.0),
+                "last_seen": row.last_seen.isoformat() if row.last_seen else None,
+            }
+            for row in rows
+        ]
+    }
+
+
+@router.get(
+    "/areas/{area_id}/export",
+    summary="Export Area Bins",
+    description="Export bins for an area as JSON or CSV"
+)
+async def export_area(area_id: int, format: str = Query("json"), db: Session = Depends(get_db)):
+    area = db.query(AreaModel).filter(AreaModel.id == area_id).first()
+    if not area:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Area not found")
+
+    bins = (
+        db.query(BinModel)
+        .filter(BinModel.area_id == area_id)
+        .order_by(BinModel.priority_score.desc(), BinModel.updated_at.desc())
+        .all()
+    )
+
+    fmt = format.lower()
+    if fmt not in {"json", "csv"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid export format")
+
+    if fmt == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "area_name",
+            "bin_id",
+            "ops_status",
+            "priority_score",
+            "last_fill_status",
+            "last_fill_conf",
+            "capture_count",
+            "last_seen_at",
+            "updated_at",
+        ])
+        for b in bins:
+            writer.writerow([
+                area.name,
+                b.id,
+                b.ops_status,
+                b.priority_score,
+                b.last_status,
+                b.last_conf,
+                b.capture_count,
+                b.last_seen_at.isoformat() if b.last_seen_at else "",
+                b.updated_at.isoformat(),
+            ])
+        csv_data = output.getvalue()
+        filename = f"area_{area.id}_bins.csv"
+        return Response(
+            content=csv_data,
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+
+    export_bins = []
+    for b in bins:
+        captures = (
+            db.query(CaptureModel)
+            .filter(CaptureModel.bin_id == b.id)
+            .order_by(CaptureModel.created_at.desc())
+            .all()
+        )
+        export_bins.append(
+            {
+                "id": b.id,
+                "ops_status": b.ops_status,
+                "priority_score": b.priority_score,
+                "priority_reason": b.priority_reason,
+                "last_fill_status": b.last_status,
+                "last_fill_conf": b.last_conf,
+                "capture_count": b.capture_count,
+                "last_seen_at": b.last_seen_at.isoformat() if b.last_seen_at else None,
+                "updated_at": b.updated_at.isoformat(),
+                "captures": [
+                    {
+                        "id": c.id,
+                        "created_at": c.created_at.isoformat(),
+                        "status": c.status,
+                        "conf": c.conf,
+                        "image_url": f"/api/v1/captures/{c.id}/image",
+                    }
+                    for c in captures
+                ],
+            }
+        )
+
+    return {
+        "area": {"id": area.id, "name": area.name},
+        "bins": export_bins,
+    }
 
 
 @router.post(
