@@ -51,6 +51,19 @@ interface DashboardArea {
   captures_count: number;
   max_priority: number;
   last_seen: string | null;
+  last_status_counts: {
+    EMPTY: number;
+    HALF: number;
+    FULL: number;
+    NO_BIN_DETECTED: number;
+  };
+  ops_status_counts: {
+    NEW: number;
+    ON_PROCESS: number;
+    TRUCK_DISPATCHED: number;
+    EMPTIED: number;
+    FALSE_POSITIVE: number;
+  };
 }
 
 export default function Home() {
@@ -393,6 +406,15 @@ export default function Home() {
                   <div>Bins: {area.bins_count}</div>
                   <div>Captures: {area.captures_count}</div>
                   <div>Max priority: {area.max_priority.toFixed(0)}</div>
+                  <div>
+                    Status: E {area.last_status_counts.EMPTY} · H {area.last_status_counts.HALF} · F{" "}
+                    {area.last_status_counts.FULL} · N {area.last_status_counts.NO_BIN_DETECTED}
+                  </div>
+                  <div>
+                    Ops: N {area.ops_status_counts.NEW} · P {area.ops_status_counts.ON_PROCESS} · T{" "}
+                    {area.ops_status_counts.TRUCK_DISPATCHED} · E {area.ops_status_counts.EMPTIED} · FP{" "}
+                    {area.ops_status_counts.FALSE_POSITIVE}
+                  </div>
                   <div className="text-gray-500">
                     Last seen: {area.last_seen ? new Date(area.last_seen).toLocaleString() : "-"}
                   </div>

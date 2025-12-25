@@ -310,12 +310,13 @@ Controls:
 - Clear captured bins
 - Export JSON of captured bins
 - Quality selector (Fast/Balanced/Accurate)
+- Target FPS + confidence tuning
 
 ### Areas (Required)
 
 1) Enter an **Area name** and click **Set Area**.
 2) Start the camera. All captures are grouped under the active area.
-3) Use **+ New Session** to reset tracking and start a fresh run.
+3) Use **+ New Area** to switch to a new area (clears captures + starts a new session).
 4) Areas can be deleted from the dashboard (this removes all bins/captures under the area).
 
 ### Admin Workflow (Dashboard)
@@ -323,12 +324,13 @@ Controls:
 The main dashboard shows **Areas** (one row per area). Open an area to browse bins and update operational status:
 
 - Dashboard → Areas → Open → `/areas/<id>`
+- Area cards include counts by last fill status and ops status.
 
 - `NEW` → default when first captured
 - `ON_PROCESS` → admin acknowledged
-- `TRUCK_SENT` → truck assigned
+- `TRUCK_DISPATCHED` → truck assigned
 - `EMPTIED` → cleared
-- `CLOSED` → false positive / ignored
+- `FALSE_POSITIVE` → false positive / ignored
 
 ### Priority Scoring
 
@@ -337,8 +339,8 @@ Priority is computed automatically when captures or status change:
 - `FULL` = 100, `HALF` = 60, `EMPTY` = 20
 - + `round(fill_conf * 20)`
 - + `min(capture_count * 2, 20)`
-- `ON_PROCESS` = -10, `TRUCK_SENT` = -20
-- `EMPTIED`/`CLOSED` = 0
+- `ON_PROCESS` = -10, `TRUCK_DISPATCHED` = -20
+- `EMPTIED`/`FALSE_POSITIVE` = 0
 
 ### Export per Area
 
@@ -373,7 +375,10 @@ data/training/hard_negatives/<area>/<timestamp>_<bin_id>.jpg
 ```bash
 curl -sS -X POST "http://localhost:8000/api/v1/analyze-frame" \
   -F "file=@/path/to/frame.jpg" \
-  -F "area_id=1" | python3 -m json.tool
+  -F "area_id=1" \
+  -F "conf=0.25" \
+  -F "iou=0.7" \
+  -F "imgsz=640" | python3 -m json.tool
 ```
 
 ### Backend API (capture)
@@ -394,32 +399,53 @@ curl -sS -X POST "http://localhost:8000/api/v1/areas" \
 curl -sS -X POST "http://localhost:8000/api/v1/areas" \
   -F "name=Downtown" | python3 -m json.tool
 
-# 2) Analyze frame with area_id
+# 2) List areas with aggregates
+curl -sS "http://localhost:8000/api/v1/areas" | python3 -m json.tool
+
+# 3) Analyze frame with area_id
 curl -sS -X POST "http://localhost:8000/api/v1/analyze-frame" \
   -F "file=@/path/to/frame.jpg" \
   -F "area_id=1" | python3 -m json.tool
 
-# 3) List dashboard bins sorted by priority
+# 4) List dashboard bins sorted by priority
 curl -sS "http://localhost:8000/api/v1/dashboard/bins" | python3 -m json.tool
 
-# 4) Patch bin status
+# 5) Patch bin status
 curl -sS -X PATCH "http://localhost:8000/api/v1/bins/1" \
   -H "Content-Type: application/json" \
   -d '{"ops_status":"ON_PROCESS"}' | python3 -m json.tool
 
-# 5) Mark false positive
+# 6) Mark false positive
 curl -sS -X POST "http://localhost:8000/api/v1/bins/1/false-positive" \
   -H "Content-Type: application/json" \
   -d '{"note":"Not a real bin"}' | python3 -m json.tool
 
-# 6) Export area JSON/CSV
+# 7) Export area JSON/CSV
 curl -sS "http://localhost:8000/api/v1/areas/1/export?format=json" | python3 -m json.tool
 curl -sS "http://localhost:8000/api/v1/areas/1/export?format=csv" -o area_1_bins.csv
 
-# 7) Delete bin / area
+# 8) Delete bin / area
 curl -sS -X DELETE "http://localhost:8000/api/v1/bins/1"
 curl -sS -X DELETE "http://localhost:8000/api/v1/areas/1"
 ```
+
+### Optional Performance Hooks
+
+Segmentation (stub):
+
+```
+ENABLE_SEGMENTATION=true
+SEGMENTATION_BACKEND=sam2
+```
+
+TensorRT (Linux + NVIDIA only):
+
+```
+ENABLE_TENSORRT=true
+TENSORRT_ENGINE_PATH=/path/to/model.engine
+```
+
+If the engine is missing or fails to load, the service falls back to normal YOLO weights.
 
 #### Option B: Using cURL
 

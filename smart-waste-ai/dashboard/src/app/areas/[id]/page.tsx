@@ -37,6 +37,12 @@ export default function AreaDetailPage({ params }: { params: { id: string } }) {
   const [toast, setToast] = useState<string | null>(null);
   const router = useRouter();
 
+  const formatOpsStatus = (value: string) => {
+    if (value === "TRUCK_SENT") return "TRUCK_DISPATCHED";
+    if (value === "CLOSED") return "FALSE_POSITIVE";
+    return value;
+  };
+
   const fetchArea = async () => {
     try {
       const res = await fetch(`${API_BASE}/api/v1/dashboard/areas`);
@@ -150,9 +156,9 @@ export default function AreaDetailPage({ params }: { params: { id: string } }) {
                 <option value="">All</option>
                 <option value="NEW">NEW</option>
                 <option value="ON_PROCESS">ON_PROCESS</option>
-                <option value="TRUCK_SENT">TRUCK_SENT</option>
+                <option value="TRUCK_DISPATCHED">TRUCK_DISPATCHED</option>
                 <option value="EMPTIED">EMPTIED</option>
-                <option value="CLOSED">CLOSED</option>
+                <option value="FALSE_POSITIVE">FALSE_POSITIVE</option>
               </select>
             </div>
             <div className="flex items-center gap-2">
@@ -187,7 +193,7 @@ export default function AreaDetailPage({ params }: { params: { id: string } }) {
                     <div>
                       Status: {bin.last_status || "-"} ({((bin.last_conf || 0) * 100).toFixed(0)}%)
                     </div>
-                    <div>Ops: {bin.ops_status}</div>
+                    <div>Ops: {formatOpsStatus(bin.ops_status)}</div>
                     <div>Priority: {bin.priority_score.toFixed(0)}</div>
                     <div>Captures: {bin.capture_count}</div>
                     <div className="text-gray-500">

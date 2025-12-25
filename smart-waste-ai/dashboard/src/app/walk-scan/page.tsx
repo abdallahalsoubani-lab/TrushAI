@@ -50,7 +50,7 @@ export default function WalkScanPage() {
   const activeAreaIdRef = useRef<number | null>(null);
 
   const [running, setRunning] = useState(false);
-  const [fps, setFps] = useState(4);
+  const [fps, setFps] = useState(6);
   const [detections, setDetections] = useState<Detection[]>([]);
   const [captures, setCaptures] = useState<CaptureItem[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -66,10 +66,10 @@ export default function WalkScanPage() {
   });
   const sessionIdRef = useRef<string>(sessionId);
   const [minConf, setMinConf] = useState(() => {
-    if (typeof window === "undefined") return 0.5;
+    if (typeof window === "undefined") return 0.25;
     const stored = window.localStorage.getItem("walkscan_minConf");
-    const value = stored ? Number(stored) : 0.5;
-    return Number.isFinite(value) ? value : 0.5;
+    const value = stored ? Number(stored) : 0.25;
+    return Number.isFinite(value) ? value : 0.25;
   });
   const [maxArea, setMaxArea] = useState(() => {
     if (typeof window === "undefined") return 0.85;
@@ -90,10 +90,10 @@ export default function WalkScanPage() {
     return Number.isFinite(value) ? value : 3;
   });
   const [imgsz, setImgsz] = useState(() => {
-    if (typeof window === "undefined") return 480;
+    if (typeof window === "undefined") return 640;
     const stored = window.localStorage.getItem("walkscan_imgsz");
-    const value = stored ? Number(stored) : 480;
-    return Number.isFinite(value) ? value : 480;
+    const value = stored ? Number(stored) : 640;
+    return Number.isFinite(value) ? value : 640;
   });
   const [processEveryNFrames, setProcessEveryNFrames] = useState(1);
   const [minAspect, setMinAspect] = useState(0.3);
@@ -104,7 +104,12 @@ export default function WalkScanPage() {
     binsDetected: number;
     latencyMs: number;
     areaId: number | null;
+    status: string;
+    detections: number;
   } | null>(null);
+  const [noDetectionsCount, setNoDetectionsCount] = useState(0);
+
+  const noDetectionsThreshold = 5;
 
   const syncCanvas = () => {
     const video = videoRef.current;
@@ -214,9 +219,25 @@ export default function WalkScanPage() {
       body: JSON.stringify({ name }),
     });
     if (!res.ok) {
-      throw new Error("Failed to create area");
+      const payload = await res.json().catch(() => null);
+      const detail = payload?.detail || "Failed to create area";
+      throw new Error(detail);
     }
     return (await res.json()) as Area;
+  };
+
+  const ensureActiveArea = async () => {
+    if (activeAreaIdRef.current) return;
+    const name = areaNameInput.trim();
+    if (!name) {
+      throw new Error("Area name is required");
+    }
+    const area = await createOrGetArea(name);
+    applyActiveArea(area);
+    setSavedAreas((prev) => {
+      if (prev.find((a) => a.id === area.id)) return prev;
+      return [...prev, area].sort((a, b) => a.name.localeCompare(b.name));
+    });
   };
 
   const setArea = async () => {
@@ -283,14 +304,17 @@ export default function WalkScanPage() {
 
     const offscreen = offscreenRef.current || document.createElement("canvas");
     offscreenRef.current = offscreen;
-    offscreen.width = video.videoWidth;
-    offscreen.height = video.videoHeight;
+    const targetWidth = Math.min(video.videoWidth, imgsz);
+    const scale = targetWidth / video.videoWidth;
+    const targetHeight = Math.max(1, Math.round(video.videoHeight * scale));
+    offscreen.width = targetWidth;
+    offscreen.height = targetHeight;
     const ctx = offscreen.getContext("2d");
     if (!ctx) {
       inflightRef.current = false;
       return;
     }
-    ctx.drawImage(video, 0, 0);
+    ctx.drawImage(video, 0, 0, targetWidth, targetHeight);
 
     const blob = await new Promise<Blob | null>((resolve) => {
       offscreen.toBlob((b) => resolve(b), "image/jpeg", 0.8);
@@ -304,8 +328,7 @@ export default function WalkScanPage() {
       const currentAreaId = activeAreaIdRef.current;
       const currentSessionId = sessionIdRef.current;
       if (!currentAreaId) {
-        setError("Set an area before scanning");
-        return;
+        throw new Error("Set an area before scanning");
       }
       const formData = new FormData();
       formData.append("file", blob, "frame.jpg");
@@ -325,12 +348,17 @@ export default function WalkScanPage() {
         throw new Error("Analyze frame failed");
       }
       const data = await res.json();
+      const rawDetections = Array.isArray(data.detections) ? data.detections : [];
+      const detectionsCount = rawDetections.length;
       setLastApiInfo({
         binsDetected: Number(data.bins_detected || 0),
         latencyMs: Math.round(elapsed),
         areaId: currentAreaId,
+        status: String(data.status || "UNKNOWN"),
+        detections: detectionsCount,
       });
-      const filtered = filterDetections(data.detections || []);
+      setNoDetectionsCount((prev) => (detectionsCount === 0 ? prev + 1 : 0));
+      const filtered = filterDetections(rawDetections);
       const tracked = assignTrackIds(filtered, fps);
       setDetections(tracked);
       drawOverlay(tracked);
@@ -394,9 +422,7 @@ export default function WalkScanPage() {
 
   const startScan = async () => {
     try {
-      if (!activeAreaIdRef.current) {
-        throw new Error("Set an area before starting");
-      }
+      await ensureActiveArea();
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "environment" },
         audio: false,
@@ -426,6 +452,7 @@ export default function WalkScanPage() {
     }
     setDetections([]);
     drawOverlay([]);
+    setNoDetectionsCount(0);
   };
 
   const clearCaptures = () => {
@@ -436,6 +463,8 @@ export default function WalkScanPage() {
     nextIdRef.current = 1;
     frameCounterRef.current = 0;
     drawOverlay([]);
+    setNoDetectionsCount(0);
+    setLastApiInfo(null);
   };
 
   const exportJson = () => {
@@ -585,6 +614,7 @@ export default function WalkScanPage() {
                         return [...prev, area].sort((a, b) => a.name.localeCompare(b.name));
                       });
                       startNewSession();
+                      setAreaNameInput("");
                       setError(null);
                     } catch (err) {
                       setError(err instanceof Error ? err.message : "Failed to set area");
@@ -592,7 +622,7 @@ export default function WalkScanPage() {
                   }}
                   className="px-3 py-1 rounded bg-gray-200 text-gray-700 hover:bg-gray-300"
                 >
-                  + New Session
+                  + New Area
                 </button>
               </div>
               <div className="flex items-center gap-2">
@@ -642,9 +672,14 @@ export default function WalkScanPage() {
             <div className="mt-2 text-xs text-gray-600">
               Last API:{" "}
               {lastApiInfo
-                ? `bins_detected=${lastApiInfo.binsDetected} latency=${lastApiInfo.latencyMs}ms area_id=${lastApiInfo.areaId}`
+                ? `status=${lastApiInfo.status} detections=${lastApiInfo.detections} bins_detected=${lastApiInfo.binsDetected} latency=${lastApiInfo.latencyMs}ms area_id=${lastApiInfo.areaId}`
                 : "No requests yet"}
             </div>
+            {noDetectionsCount >= noDetectionsThreshold && (
+              <div className="mt-1 text-xs text-amber-700">
+                No detections for {noDetectionsCount} cycles. Check conf/imgsz.
+              </div>
+            )}
             <div className="mt-4 flex flex-wrap gap-3 items-center">
               {!running ? (
                 <button

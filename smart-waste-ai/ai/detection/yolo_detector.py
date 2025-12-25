@@ -74,6 +74,20 @@ class YOLOv8Detector(DetectorInterface):
             from ultralytics import YOLO
 
             weights_path = config.get_yolo_weights_path()
+            engine_path = None
+            if config.ENABLE_TENSORRT:
+                if config.TENSORRT_ENGINE_PATH:
+                    candidate = Path(config.TENSORRT_ENGINE_PATH)
+                    if candidate.exists():
+                        engine_path = candidate
+                        weights_path = str(candidate)
+                        logger.info(f"TensorRT enabled, using engine: {weights_path}")
+                    else:
+                        logger.warning(
+                            f"TensorRT enabled but engine not found: {candidate}. Falling back to weights."
+                        )
+                else:
+                    logger.warning("TensorRT enabled but TENSORRT_ENGINE_PATH is empty. Falling back to weights.")
             logger.info(f"Loading YOLO model: {weights_path}")
 
             default_weights = {
@@ -83,12 +97,33 @@ class YOLOv8Detector(DetectorInterface):
                 "yolov8l.pt",
                 "yolov8x.pt",
             }
-            if Path(weights_path).name not in default_weights:
-                config.DETECT_ALL_OBJECTS = False
-                config.TRASH_BIN_CLASSES = ["trash_container"]
+            prev_detect_all = config.DETECT_ALL_OBJECTS
+            prev_classes = list(config.TRASH_BIN_CLASSES)
+
+            def apply_weights_config(path: str) -> None:
+                if Path(path).name not in default_weights:
+                    config.DETECT_ALL_OBJECTS = False
+                    config.TRASH_BIN_CLASSES = ["trash_container"]
+                else:
+                    config.DETECT_ALL_OBJECTS = prev_detect_all
+                    config.TRASH_BIN_CLASSES = prev_classes
+
+            apply_weights_config(weights_path)
 
             # Load model (downloads weights if not cached)
-            self.model = YOLO(weights_path)
+            try:
+                self.model = YOLO(weights_path)
+            except Exception:
+                if engine_path is not None and str(engine_path) == str(weights_path):
+                    fallback_weights = config.get_yolo_weights_path()
+                    logger.warning(
+                        "TensorRT engine load failed, falling back to weights: %s",
+                        fallback_weights
+                    )
+                    apply_weights_config(fallback_weights)
+                    self.model = YOLO(fallback_weights)
+                else:
+                    raise
 
             # Move to specified device
             self.model.to(self.device)
@@ -152,6 +187,12 @@ class YOLOv8Detector(DetectorInterface):
                 )
 
             detections = self._run_yolo(image, conf_thresh)
+            if config.ENABLE_SEGMENTATION:
+                try:
+                    from ai.segmentation.sam2_stub import refine_detections
+                    detections = refine_detections(image, detections)
+                except Exception as e:
+                    logger.warning(f"Segmentation hook failed, using raw detections: {e}")
 
             if log_enabled:
                 if detections:

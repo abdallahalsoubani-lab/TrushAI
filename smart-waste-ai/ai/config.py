@@ -83,6 +83,21 @@ class Config:
     MIN_ASPECT_RATIO: float = 0.3  # Height/Width ratio
     MAX_ASPECT_RATIO: float = 3.0
 
+    # Second-stage filter for walk-scan (post YOLO)
+    ENABLE_SECOND_STAGE_FILTER: bool = os.getenv("ENABLE_SECOND_STAGE_FILTER", "True").lower() == "true"
+    SECOND_STAGE_MIN_AREA: float = float(os.getenv("SECOND_STAGE_MIN_AREA", "0.02"))
+    SECOND_STAGE_MAX_AREA: float = float(os.getenv("SECOND_STAGE_MAX_AREA", "0.85"))
+    SECOND_STAGE_MIN_ASPECT: float = float(os.getenv("SECOND_STAGE_MIN_ASPECT", "0.3"))
+    SECOND_STAGE_MAX_ASPECT: float = float(os.getenv("SECOND_STAGE_MAX_ASPECT", "3.5"))
+
+    # Optional segmentation hook (disabled by default)
+    ENABLE_SEGMENTATION: bool = os.getenv("ENABLE_SEGMENTATION", "False").lower() == "true"
+    SEGMENTATION_BACKEND: str = os.getenv("SEGMENTATION_BACKEND", "sam2")
+
+    # Optional TensorRT engine hook (disabled by default)
+    ENABLE_TENSORRT: bool = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
+    TENSORRT_ENGINE_PATH: str = os.getenv("TENSORRT_ENGINE_PATH", "").strip()
+
     # ====================================================================
     # FILL LEVEL CLASSIFICATION CONFIGURATION
     # ====================================================================

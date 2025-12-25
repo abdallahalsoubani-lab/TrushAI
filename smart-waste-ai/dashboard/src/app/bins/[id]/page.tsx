@@ -55,13 +55,20 @@ export default function BinDetailPage({ params }: { params: { id: string } }) {
   const [note, setNote] = useState<string | null>(null);
   const router = useRouter();
 
+  const normalizeOpsStatus = (value?: string | null) => {
+    if (!value) return "NEW";
+    if (value === "TRUCK_SENT") return "TRUCK_DISPATCHED";
+    if (value === "CLOSED") return "FALSE_POSITIVE";
+    return value;
+  };
+
   const fetchBin = async () => {
     try {
       const res = await fetch(`${API_BASE}/api/v1/bins/${params.id}`);
       if (!res.ok) throw new Error("Failed to load bin");
       const data = await res.json();
       setBin(data);
-      setOpsStatus(data.ops_status || "NEW");
+      setOpsStatus(normalizeOpsStatus(data.ops_status));
       setOpsNotes(data.ops_notes || "");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load bin");
@@ -185,9 +192,9 @@ export default function BinDetailPage({ params }: { params: { id: string } }) {
                 >
                   <option value="NEW">NEW</option>
                   <option value="ON_PROCESS">ON_PROCESS</option>
-                  <option value="TRUCK_SENT">TRUCK_SENT</option>
+                  <option value="TRUCK_DISPATCHED">TRUCK_DISPATCHED</option>
                   <option value="EMPTIED">EMPTIED</option>
-                  <option value="CLOSED">CLOSED</option>
+                  <option value="FALSE_POSITIVE">FALSE_POSITIVE</option>
                 </select>
                 <input
                   type="text"

@@ -26,7 +26,7 @@ from fastapi import APIRouter, HTTPException, status, UploadFile, File, Depends,
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pathlib import Path
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, case, or_
 
 from backend.schemas.bin_status import (
     BinStatusResponse,
@@ -93,25 +93,27 @@ OPS_STATUS_VALUES = {
     "REPORTED",
     "ON_PROCESS",
     "TRUCK_SENT",
+    "TRUCK_DISPATCHED",
     "EMPTIED",
     "CLOSED",
+    "FALSE_POSITIVE",
     "RESOLVED",
 }
 
 
 def _compute_priority(status: str, conf: float, capture_count: int, ops_status: str) -> tuple[float, str]:
     base_map = {"FULL": 100, "HALF": 60, "EMPTY": 20}
-    if ops_status in {"EMPTIED", "CLOSED"}:
+    if ops_status in {"EMPTIED", "CLOSED", "FALSE_POSITIVE"}:
         return 0.0, f"{ops_status} => 0"
     base = base_map.get(status, 20)
     score = base + round(conf * 20) + min(capture_count * 2, 20)
     if ops_status == "ON_PROCESS":
         score -= 10
-    if ops_status == "TRUCK_SENT":
+    if ops_status in {"TRUCK_SENT", "TRUCK_DISPATCHED"}:
         score -= 20
     score = max(score, 0)
     reason = f"{status} + conf + repeats"
-    if ops_status in {"ON_PROCESS", "TRUCK_SENT"}:
+    if ops_status in {"ON_PROCESS", "TRUCK_SENT", "TRUCK_DISPATCHED"}:
         reason += f" - {ops_status}"
     return score, reason
 
@@ -168,6 +170,103 @@ def _delete_bin_with_assets(db: Session, bin_record: BinModel) -> None:
     db.query(CaptureModel).filter(CaptureModel.bin_id == bin_record.id).delete(synchronize_session=False)
     db.query(BinEventModel).filter(BinEventModel.bin_id == bin_record.id).delete(synchronize_session=False)
     db.delete(bin_record)
+
+
+def _get_area_aggregates(db: Session) -> list[dict]:
+    bins_sub = (
+        db.query(
+            BinModel.area_id.label("area_id"),
+            func.count(BinModel.id).label("bins_count"),
+            func.max(BinModel.priority_score).label("max_priority"),
+            func.max(BinModel.updated_at).label("last_seen"),
+            func.sum(case((BinModel.last_status == "EMPTY", 1), else_=0)).label("empty_count"),
+            func.sum(case((BinModel.last_status == "HALF", 1), else_=0)).label("half_count"),
+            func.sum(case((BinModel.last_status == "FULL", 1), else_=0)).label("full_count"),
+            func.sum(
+                case(
+                    (or_(BinModel.last_status == "NO_BIN_DETECTED", BinModel.last_status.is_(None)), 1),
+                    else_=0,
+                )
+            ).label("no_bin_count"),
+            func.sum(case((BinModel.ops_status == "NEW", 1), else_=0)).label("ops_new"),
+            func.sum(case((BinModel.ops_status == "ON_PROCESS", 1), else_=0)).label("ops_on_process"),
+            func.sum(
+                case(
+                    (BinModel.ops_status.in_(["TRUCK_SENT", "TRUCK_DISPATCHED"]), 1),
+                    else_=0,
+                )
+            ).label("ops_truck"),
+            func.sum(case((BinModel.ops_status == "EMPTIED", 1), else_=0)).label("ops_emptied"),
+            func.sum(
+                case(
+                    (BinModel.ops_status.in_(["CLOSED", "FALSE_POSITIVE"]), 1),
+                    else_=0,
+                )
+            ).label("ops_false"),
+        )
+        .group_by(BinModel.area_id)
+        .subquery()
+    )
+    captures_sub = (
+        db.query(
+            CaptureModel.area_id.label("area_id"),
+            func.count(CaptureModel.id).label("captures_count"),
+        )
+        .group_by(CaptureModel.area_id)
+        .subquery()
+    )
+    rows = (
+        db.query(
+            AreaModel.id.label("area_id"),
+            AreaModel.name.label("area_name"),
+            func.coalesce(bins_sub.c.bins_count, 0).label("bins_count"),
+            func.coalesce(captures_sub.c.captures_count, 0).label("captures_count"),
+            func.coalesce(bins_sub.c.max_priority, 0.0).label("max_priority"),
+            bins_sub.c.last_seen.label("last_seen"),
+            func.coalesce(bins_sub.c.empty_count, 0).label("empty_count"),
+            func.coalesce(bins_sub.c.half_count, 0).label("half_count"),
+            func.coalesce(bins_sub.c.full_count, 0).label("full_count"),
+            func.coalesce(bins_sub.c.no_bin_count, 0).label("no_bin_count"),
+            func.coalesce(bins_sub.c.ops_new, 0).label("ops_new"),
+            func.coalesce(bins_sub.c.ops_on_process, 0).label("ops_on_process"),
+            func.coalesce(bins_sub.c.ops_truck, 0).label("ops_truck"),
+            func.coalesce(bins_sub.c.ops_emptied, 0).label("ops_emptied"),
+            func.coalesce(bins_sub.c.ops_false, 0).label("ops_false"),
+        )
+        .outerjoin(bins_sub, bins_sub.c.area_id == AreaModel.id)
+        .outerjoin(captures_sub, captures_sub.c.area_id == AreaModel.id)
+        .order_by(AreaModel.name.asc())
+        .all()
+    )
+
+    results = []
+    for row in rows:
+        results.append(
+            {
+                "area_id": row.area_id,
+                "area_name": row.area_name,
+                "id": row.area_id,
+                "name": row.area_name,
+                "bins_count": int(row.bins_count or 0),
+                "captures_count": int(row.captures_count or 0),
+                "max_priority": float(row.max_priority or 0.0),
+                "last_seen": row.last_seen.isoformat() if row.last_seen else None,
+                "last_status_counts": {
+                    "EMPTY": int(row.empty_count or 0),
+                    "HALF": int(row.half_count or 0),
+                    "FULL": int(row.full_count or 0),
+                    "NO_BIN_DETECTED": int(row.no_bin_count or 0),
+                },
+                "ops_status_counts": {
+                    "NEW": int(row.ops_new or 0),
+                    "ON_PROCESS": int(row.ops_on_process or 0),
+                    "TRUCK_DISPATCHED": int(row.ops_truck or 0),
+                    "EMPTIED": int(row.ops_emptied or 0),
+                    "FALSE_POSITIVE": int(row.ops_false or 0),
+                },
+            }
+        )
+    return results
 @router.get(
     "/health",
     response_model=HealthCheckResponse,
@@ -833,6 +932,7 @@ async def analyze_frame(
     area_id: Optional[int] = Form(None),
     imgsz: Optional[int] = Form(None),
     conf: Optional[float] = Form(None),
+    iou: Optional[float] = Form(None),
     db: Session = Depends(get_db)
 ):
     try:
@@ -858,6 +958,7 @@ async def analyze_frame(
         area_id_value = area_id
         imgsz_value = imgsz
         conf_value = conf
+        iou_value = iou
         if area_id_value is None and request is not None:
             query_value = request.query_params.get("area_id")
             if query_value:
@@ -873,6 +974,10 @@ async def analyze_frame(
             query_value = request.query_params.get("conf")
             if query_value:
                 conf_value = query_value
+        if iou_value is None and request is not None:
+            query_value = request.query_params.get("iou")
+            if query_value:
+                iou_value = query_value
 
         if area_id_value is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="area_id is required")
@@ -889,6 +994,14 @@ async def analyze_frame(
         if imgsz_value <= 0:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid imgsz")
 
+        iou_value = iou_value if iou_value is not None else 0.7
+        try:
+            iou_value = float(iou_value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid iou")
+        if iou_value <= 0 or iou_value > 1:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid iou")
+
         if conf_value is not None:
             try:
                 conf_value = float(conf_value)
@@ -898,8 +1011,11 @@ async def analyze_frame(
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid conf")
 
         original_imgsz = config.YOLO_IMAGE_SIZE
+        original_iou = config.YOLO_IOU_THRESHOLD
         if imgsz_value != original_imgsz:
             config.YOLO_IMAGE_SIZE = imgsz_value
+        if iou_value != original_iou:
+            config.YOLO_IOU_THRESHOLD = iou_value
         try:
             detections = service.pipeline.detector.detect(
                 image,
@@ -907,6 +1023,31 @@ async def analyze_frame(
             )
         finally:
             config.YOLO_IMAGE_SIZE = original_imgsz
+            config.YOLO_IOU_THRESHOLD = original_iou
+
+        if config.ENABLE_SECOND_STAGE_FILTER:
+            before_count = len(detections)
+            filtered = []
+            for det in detections:
+                x1, y1, x2, y2 = det.bbox
+                w = max(0, x2 - x1)
+                h = max(0, y2 - y1)
+                if w == 0 or h == 0:
+                    continue
+                area_norm = (w * h) / float(image.shape[1] * image.shape[0])
+                ar = w / h if h else 0
+                if area_norm < config.SECOND_STAGE_MIN_AREA or area_norm > config.SECOND_STAGE_MAX_AREA:
+                    continue
+                if ar < config.SECOND_STAGE_MIN_ASPECT or ar > config.SECOND_STAGE_MAX_ASPECT:
+                    continue
+                filtered.append(det)
+            detections = filtered
+            if before_count != len(detections):
+                logger.debug(
+                    "Second-stage filter: before=%s after=%s",
+                    before_count,
+                    len(detections),
+                )
         if not detections:
             return {
                 "detections": [],
@@ -1021,8 +1162,7 @@ async def create_or_get_area(request: Request, db: Session = Depends(get_db)):
     description="List all configured areas"
 )
 async def list_areas(db: Session = Depends(get_db)):
-    areas = db.query(AreaModel).order_by(AreaModel.name.asc()).all()
-    return {"areas": [{"id": a.id, "name": a.name} for a in areas]}
+    return {"areas": _get_area_aggregates(db)}
 
 
 @router.delete(
@@ -1431,7 +1571,7 @@ async def mark_false_positive(bin_id: int, request: FalsePositiveRequest, db: Se
 
     note = request.note.strip() if request.note else None
     old_status = bin_record.ops_status
-    bin_record.ops_status = "CLOSED"
+    bin_record.ops_status = "FALSE_POSITIVE"
     bin_record.is_false_positive = True
     if note:
         bin_record.ops_notes = note
@@ -1442,7 +1582,7 @@ async def mark_false_positive(bin_id: int, request: FalsePositiveRequest, db: Se
         bin_record.id,
         "MARK_FALSE_POSITIVE",
         from_status=old_status,
-        to_status="CLOSED",
+        to_status="FALSE_POSITIVE",
         note=note,
     )
     _update_bin_priority(bin_record)
@@ -1524,7 +1664,12 @@ async def dashboard_bins(
     if area_id is not None:
         query = query.filter(BinModel.area_id == area_id)
     if ops_status:
-        query = query.filter(BinModel.ops_status == ops_status)
+        if ops_status == "TRUCK_DISPATCHED":
+            query = query.filter(BinModel.ops_status.in_(["TRUCK_SENT", "TRUCK_DISPATCHED"]))
+        elif ops_status == "FALSE_POSITIVE":
+            query = query.filter(BinModel.ops_status.in_(["CLOSED", "FALSE_POSITIVE"]))
+        else:
+            query = query.filter(BinModel.ops_status == ops_status)
     if min_priority is not None:
         query = query.filter(BinModel.priority_score >= min_priority)
 
@@ -1569,53 +1714,7 @@ async def dashboard_bins(
     description="Aggregate areas with bin/capture counts"
 )
 async def dashboard_areas(db: Session = Depends(get_db)):
-    bins_sub = (
-        db.query(
-            BinModel.area_id.label("area_id"),
-            func.count(BinModel.id).label("bins_count"),
-            func.max(BinModel.priority_score).label("max_priority"),
-            func.max(BinModel.last_seen_at).label("last_seen"),
-        )
-        .group_by(BinModel.area_id)
-        .subquery()
-    )
-    captures_sub = (
-        db.query(
-            CaptureModel.area_id.label("area_id"),
-            func.count(CaptureModel.id).label("captures_count"),
-        )
-        .group_by(CaptureModel.area_id)
-        .subquery()
-    )
-
-    rows = (
-        db.query(
-            AreaModel.id.label("area_id"),
-            AreaModel.name.label("area_name"),
-            func.coalesce(bins_sub.c.bins_count, 0).label("bins_count"),
-            func.coalesce(captures_sub.c.captures_count, 0).label("captures_count"),
-            func.coalesce(bins_sub.c.max_priority, 0.0).label("max_priority"),
-            bins_sub.c.last_seen.label("last_seen"),
-        )
-        .outerjoin(bins_sub, bins_sub.c.area_id == AreaModel.id)
-        .outerjoin(captures_sub, captures_sub.c.area_id == AreaModel.id)
-        .order_by(AreaModel.name.asc())
-        .all()
-    )
-
-    return {
-        "areas": [
-            {
-                "area_id": row.area_id,
-                "area_name": row.area_name,
-                "bins_count": int(row.bins_count or 0),
-                "captures_count": int(row.captures_count or 0),
-                "max_priority": float(row.max_priority or 0.0),
-                "last_seen": row.last_seen.isoformat() if row.last_seen else None,
-            }
-            for row in rows
-        ]
-    }
+    return {"areas": _get_area_aggregates(db)}
 
 
 @router.get(
