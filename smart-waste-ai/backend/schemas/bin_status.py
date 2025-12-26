@@ -307,6 +307,38 @@ class UploadAnalysisResponse(BaseModel):
         None,
         description="Sampling strategy used (video only)"
     )
+    effective_conf: Optional[float] = Field(
+        None,
+        description="Effective confidence threshold used"
+    )
+    effective_imgsz: Optional[int] = Field(
+        None,
+        description="Effective image size used"
+    )
+    raw_count: Optional[int] = Field(
+        None,
+        description="Raw detection count before filtering"
+    )
+    filtered_out_count: Optional[int] = Field(
+        None,
+        description="Detections filtered out by strict rules"
+    )
+    kept_count: Optional[int] = Field(
+        None,
+        description="Detections kept after filtering"
+    )
+    kept_class_names: Optional[list[str]] = Field(
+        None,
+        description="Unique class names kept after filtering"
+    )
+    kept: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        description="Kept detections after filtering"
+    )
+    rejected: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        description="Rejected detections with reasons"
+    )
 
     class Config:
         """Pydantic configuration."""

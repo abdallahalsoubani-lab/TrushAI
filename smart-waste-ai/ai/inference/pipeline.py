@@ -26,6 +26,7 @@ from ai.detection.detector_interface import Detection
 from ai.classification.fill_level_classifier import get_classifier
 from ai.classification.classifier_interface import FillLevel, ClassificationResult
 from ai.config import config
+from ai.inference.filters import filter_detections_stage_a
 
 # Set up logging
 logging.basicConfig(
@@ -159,6 +160,10 @@ class InferencePipeline:
             confidence_override = config.DEBUG_CONFIDENCE_OVERRIDE
         if confidence_override is None and debug_enabled:
             confidence_override = 0.15
+        effective_conf = max(
+            confidence_override if confidence_override is not None else config.YOLO_CONFIDENCE_THRESHOLD,
+            config.YOLO_CONFIDENCE_THRESHOLD
+        )
 
         sampling_strategy = sampling_strategy or config.VIDEO_SAMPLING_STRATEGY
         min_detections = min_detections or config.MIN_DETECTIONS_FOR_VALID_BIN
@@ -180,17 +185,19 @@ class InferencePipeline:
 
         # Process each frame
         all_detections = []
+        frame_stats_list = []
         analyzed_indices = []
         stopped_early = False
         for i, frame in enumerate(frames):
             frame_idx = frame_indices[i]
-            frame_detections = self._process_frame(
+            frame_detections, frame_stats = self._process_frame(
                 frame,
                 frame_idx,
-                confidence_override=confidence_override,
+                confidence_override=effective_conf,
                 log_detections=debug_enabled
             )
             all_detections.append(frame_detections)
+            frame_stats_list.append(frame_stats)
             analyzed_indices.append(frame_idx)
 
             logger.debug(
@@ -224,7 +231,7 @@ class InferencePipeline:
                 frames[:len(analyzed_indices)],
                 analyzed_indices,
                 video_path.stem,
-                confidence_override=confidence_override
+                confidence_override=effective_conf
             )
 
         processing_time = time.time() - start_time
@@ -234,14 +241,14 @@ class InferencePipeline:
             f"({len(tracked_bins)} bins detected)"
         )
 
-        detections = []
+        detections = frame_stats_list
         if debug_artifacts and debug_artifacts.get("metadata"):
             try:
                 with open(debug_artifacts["metadata"], "r") as f:
                     debug_metadata = json.load(f)
-                detections = debug_metadata.get("detections", [])
+                detections = debug_metadata.get("detections", frame_stats_list)
             except Exception:
-                detections = []
+                detections = frame_stats_list
 
         result = PipelineResult(
             video_path=str(video_path),
@@ -255,6 +262,8 @@ class InferencePipeline:
                 "frame_skip": frame_skip or "default",
                 "frame_info": frame_info,
                 "debug_confidence_override": confidence_override if debug_enabled else None,
+                "effective_conf": effective_conf,
+                "effective_imgsz": config.YOLO_IMAGE_SIZE,
                 "sampling_strategy": sampling_strategy,
                 "frame_indices": analyzed_indices,
                 "frames_analyzed": len(analyzed_indices),
@@ -348,7 +357,7 @@ class InferencePipeline:
         frame_idx: int,
         confidence_override: Optional[float] = None,
         log_detections: bool = False
-    ) -> List[Tuple[Detection, ClassificationResult]]:
+    ) -> Tuple[List[Tuple[Detection, ClassificationResult]], Dict[str, object]]:
         """
         Process a single frame: detect and classify bins.
 
@@ -359,11 +368,21 @@ class InferencePipeline:
         Returns:
             List of (Detection, ClassificationResult) tuples
         """
-        # Detect bins in frame
-        detections = self.detector.detect(
+        # Detect raw objects in frame
+        effective_conf = max(
+            confidence_override if confidence_override is not None else config.YOLO_CONFIDENCE_THRESHOLD,
+            config.YOLO_CONFIDENCE_THRESHOLD
+        )
+        raw_detections = self.detector.detect_raw(
             frame,
-            confidence_threshold=confidence_override,
+            confidence_threshold=effective_conf,
             log_detections=log_detections
+        )
+
+        detections, kept_info, rejected_info, filter_stats = filter_detections_stage_a(
+            raw_detections,
+            frame.shape,
+            effective_conf
         )
 
         results = []
@@ -380,7 +399,31 @@ class InferencePipeline:
                     f"Classification failed for bin in frame {frame_idx}: {e}"
                 )
 
-        return results
+        top_detections = sorted(
+            raw_detections,
+            key=lambda d: d.confidence,
+            reverse=True
+        )[: config.DEBUG_DETECTIONS_LIMIT]
+
+        stats = {
+            "frame_index": frame_idx,
+            "raw_count": filter_stats["raw_count"],
+            "kept_count": filter_stats["kept_count"],
+            "filtered_out_count": filter_stats["filtered_out_count"],
+            "kept_class_names": filter_stats["kept_class_names"],
+            "kept": kept_info,
+            "rejected": rejected_info,
+            "top_detections": [
+                {
+                    "class_name": det.class_name,
+                    "confidence": float(det.confidence),
+                    "bbox": det.bbox,
+                }
+                for det in top_detections
+            ],
+        }
+
+        return results, stats
 
     def _save_debug_frames(
         self,
@@ -403,10 +446,16 @@ class InferencePipeline:
             "metadata": None
         }
 
+        effective_conf = max(
+            confidence_override if confidence_override is not None else config.YOLO_CONFIDENCE_THRESHOLD,
+            config.YOLO_CONFIDENCE_THRESHOLD
+        )
         metadata = {
             "video_name": video_name,
             "frame_indices": frame_indices,
             "confidence_override": confidence_override,
+            "effective_conf": effective_conf,
+            "effective_imgsz": config.YOLO_IMAGE_SIZE,
             "detections": []
         }
 
@@ -419,22 +468,48 @@ class InferencePipeline:
             if hasattr(self.detector, "detect_raw"):
                 raw_detections = self.detector.detect_raw(
                     frame,
-                    confidence_threshold=confidence_override
+                    confidence_threshold=effective_conf
                 )
             else:
                 raw_detections = self.detector.detect(
                     frame,
-                    confidence_threshold=confidence_override
+                    confidence_threshold=effective_conf
                 )
+
+            filtered, kept_info, rejected_info, filter_stats = filter_detections_stage_a(
+                raw_detections,
+                frame.shape,
+                effective_conf
+            )
 
             annotated = self.detector.visualize_detections(frame, raw_detections)
             annotated_path = debug_dir / f"{video_name}_frame_{frame_number}_annotated.jpg"
             cv2.imwrite(str(annotated_path), annotated)
             artifacts["annotated"].append(str(annotated_path))
 
+            top_detections = sorted(
+                raw_detections,
+                key=lambda d: d.confidence,
+                reverse=True
+            )[: config.DEBUG_DETECTIONS_LIMIT]
+
             metadata["detections"].append({
                 "frame_index": frame_number,
-                "count": len(raw_detections),
+                "count": filter_stats["kept_count"],
+                "raw_count": filter_stats["raw_count"],
+                "kept_count": filter_stats["kept_count"],
+                "filtered_out_count": filter_stats["filtered_out_count"],
+                "kept_class_names": filter_stats["kept_class_names"],
+                "kept": kept_info,
+                "rejected": rejected_info,
+                "top_detections": [
+                    {
+                        "class_name": det.class_name,
+                        "confidence": float(det.confidence),
+                        "bbox": det.bbox,
+                    }
+                    for det in top_detections
+                ],
                 "items": [
                     {
                         "class_id": det.class_id,
@@ -442,7 +517,7 @@ class InferencePipeline:
                         "confidence": float(det.confidence),
                         "bbox": det.bbox
                     }
-                    for det in raw_detections
+                    for det in filtered
                 ]
             })
 

@@ -44,6 +44,7 @@ from backend.services.analysis_service import AnalysisService
 from backend.database.models import Area as AreaModel, Bin as BinModel, Capture as CaptureModel, BinEvent as BinEventModel, FillLevelEnum as DbFillLevelEnum
 from backend.config import config as backend_config
 from ai.config import config
+from ai.inference.filters import filter_detections_stage_a
 from pydantic import BaseModel
 
 # Set up logging
@@ -647,31 +648,66 @@ async def analyze_upload(
 
             metadata = result.metadata or {}
             detections = metadata.get("detections", [])
-            detections_total = 0
+            raw_total = 0
+            kept_total = 0
             frames_with_detections = 0
+            kept_class_names: set[str] = set()
+            kept_items: List[Dict] = []
+            rejected_items: List[Dict] = []
 
             if isinstance(detections, list):
                 for d in detections:
                     if isinstance(d, dict):
-                        c = int(d.get("count", 0) or 0)
-                        detections_total += c
-                        if c > 0:
+                        raw_count = int(d.get("raw_count", d.get("count", 0)) or 0)
+                        kept_count = int(d.get("kept_count", d.get("count", 0)) or 0)
+                        raw_total += raw_count
+                        kept_total += kept_count
+                        if kept_count > 0:
                             frames_with_detections += 1
+                        class_names = d.get("kept_class_names", [])
+                        if isinstance(class_names, list):
+                            kept_class_names.update(str(name) for name in class_names)
+                        kept_list = d.get("kept", [])
+                        if isinstance(kept_list, list):
+                            kept_items.extend(kept_list)
+                        rejected_list = d.get("rejected", [])
+                        if isinstance(rejected_list, list):
+                            rejected_items.extend(rejected_list)
 
             unique_bins = int(result.bins_detected or 0)
-            effective_bins_detected = unique_bins or (1 if detections_total > 0 else 0)
 
-            metadata["detections_total"] = detections_total
+            metadata["detections_total"] = kept_total
             metadata["frames_with_detections"] = frames_with_detections
 
             print(
-                f"[analyze-upload] unique_bins={unique_bins} detections_total={detections_total} "
+                f"[analyze-upload] unique_bins={unique_bins} detections_total={kept_total} "
                 f"frames_with_detections={frames_with_detections} frame_indices={metadata.get('frame_indices')}"
             )
 
+            effective_conf = float(metadata.get("effective_conf", config.YOLO_CONFIDENCE_THRESHOLD))
+            effective_imgsz = int(metadata.get("effective_imgsz", config.YOLO_IMAGE_SIZE))
+            filtered_out_total = max(0, raw_total - kept_total)
+            kept_class_names_list = sorted(kept_class_names)
+            frame_info = metadata.get("frame_info", {})
+            first_frame = frame_info.get("first_frame_size")
+            top_reason = None
+            if kept_total == 0 and rejected_items:
+                reasons = rejected_items[0].get("reasons") or []
+                top_reason = reasons[0] if reasons else "unknown"
+            if debug_enabled:
+                logger.info(
+                    "[analyze-upload:video] image_size=%s effective_conf=%.2f raw=%s kept=%s filtered_out=%s reason=%s",
+                    first_frame,
+                    effective_conf,
+                    raw_total,
+                    kept_total,
+                    filtered_out_total,
+                    top_reason or "none",
+                )
+
             # Case 1: tracking removed it but we did see detections
-            if unique_bins == 0 and detections_total > 0:
-                max_conf = 0.5
+            if unique_bins == 0 and kept_total > 0:
+                max_conf = 0.0
                 if isinstance(detections, list):
                     for frame in detections:
                         items = frame.get("items", []) if isinstance(frame, dict) else []
@@ -682,16 +718,24 @@ async def analyze_upload(
                     input_type=input_type,
                     status="BIN_DETECTED",
                     confidence=round(min(1.0, max_conf), 2),
-                    bins_detected=1,
+                    bins_detected=0,
                     message="Bin detected in frames but tracking/filter removed it (min_detections).",
                     debug_artifacts=result.debug_artifacts if debug_enabled else None,
                     frames_analyzed=metadata.get("frames_analyzed"),
                     frame_indices=metadata.get("frame_indices"),
                     sampling_strategy=metadata.get("sampling_strategy"),
+                    effective_conf=effective_conf,
+                    effective_imgsz=effective_imgsz,
+                    raw_count=raw_total,
+                    filtered_out_count=filtered_out_total,
+                    kept_count=kept_total,
+                    kept_class_names=kept_class_names_list,
+                    kept=kept_items,
+                    rejected=rejected_items,
                 )
 
             # Case 2: no detections at all
-            if unique_bins == 0:
+            if kept_total == 0:
                 return UploadAnalysisResponse(
                     input_type=input_type,
                     status="NO_BIN_DETECTED",
@@ -702,6 +746,14 @@ async def analyze_upload(
                     frames_analyzed=result.metadata.get("frames_analyzed"),
                     frame_indices=result.metadata.get("frame_indices"),
                     sampling_strategy=result.metadata.get("sampling_strategy"),
+                    effective_conf=effective_conf,
+                    effective_imgsz=effective_imgsz,
+                    raw_count=raw_total,
+                    filtered_out_count=filtered_out_total,
+                    kept_count=kept_total,
+                    kept_class_names=kept_class_names_list,
+                    kept=kept_items,
+                    rejected=rejected_items,
                 )
 
             # Aggregate results to get overall status
@@ -731,6 +783,14 @@ async def analyze_upload(
                     frames_analyzed=result.metadata.get("frames_analyzed"),
                     frame_indices=result.metadata.get("frame_indices"),
                     sampling_strategy=result.metadata.get("sampling_strategy"),
+                    effective_conf=effective_conf,
+                    effective_imgsz=effective_imgsz,
+                    raw_count=raw_total,
+                    filtered_out_count=filtered_out_total,
+                    kept_count=kept_total,
+                    kept_class_names=kept_class_names_list,
+                    kept=kept_items,
+                    rejected=rejected_items,
                 )
 
             overall_status = max(bins_by_level.keys(), key=lambda x: level_order[x])
@@ -753,6 +813,14 @@ async def analyze_upload(
                 frames_analyzed=result.metadata.get("frames_analyzed"),
                 frame_indices=result.metadata.get("frame_indices"),
                 sampling_strategy=result.metadata.get("sampling_strategy"),
+                effective_conf=effective_conf,
+                effective_imgsz=effective_imgsz,
+                raw_count=raw_total,
+                filtered_out_count=filtered_out_total,
+                kept_count=kept_total,
+                kept_class_names=kept_class_names_list,
+                kept=kept_items,
+                rejected=rejected_items,
             )
 
         else:  # image
@@ -768,8 +836,36 @@ async def analyze_upload(
                     detail="Failed to read image file"
                 )
 
-            # Run detection
-            detections = service.pipeline.detector.detect(image)
+            effective_conf = getattr(config, "YOLO_CONFIDENCE_THRESHOLD", 0.25)
+            effective_imgsz = getattr(config, "YOLO_IMAGE_SIZE", 640)
+            raw_detections = service.pipeline.detector.detect_raw(
+                image,
+                confidence_threshold=effective_conf,
+            )
+            detections, kept_info, rejected_info, filter_stats = filter_detections_stage_a(
+                raw_detections,
+                image.shape,
+                effective_conf
+            )
+            raw_count = filter_stats["raw_count"]
+            kept_count = filter_stats["kept_count"]
+            filtered_out_count = filter_stats["filtered_out_count"]
+            kept_class_names = filter_stats["kept_class_names"]
+
+            top_reason = None
+            if kept_count == 0 and rejected_info:
+                reasons = rejected_info[0].get("reasons") or []
+                top_reason = reasons[0] if reasons else "unknown"
+            logger.info(
+                "[analyze-upload:image] image_size=%sx%s effective_conf=%.2f raw=%s kept=%s filtered_out=%s reason=%s",
+                image.shape[1],
+                image.shape[0],
+                effective_conf,
+                raw_count,
+                kept_count,
+                filtered_out_count,
+                top_reason or "none",
+            )
 
             if not detections:
                 return UploadAnalysisResponse(
@@ -777,7 +873,15 @@ async def analyze_upload(
                     status="NO_BIN_DETECTED",
                     confidence=0.0,
                     bins_detected=0,
-                    message="No bins detected in image"
+                    message="No bins detected in image",
+                    effective_conf=effective_conf,
+                    effective_imgsz=effective_imgsz,
+                    raw_count=raw_count,
+                    filtered_out_count=filtered_out_count,
+                    kept_count=kept_count,
+                    kept_class_names=kept_class_names,
+                    kept=kept_info,
+                    rejected=rejected_info,
                 )
 
             # Classify each detected bin
@@ -862,6 +966,11 @@ async def analyze_upload(
                     "bins_detected": len(detections),
                     "overall_status": fullest.fill_level.value,
                     "overall_confidence": float(fullest.confidence),
+                    "raw_count": raw_count,
+                    "kept_count": kept_count,
+                    "kept_class_names": kept_class_names,
+                    "kept": kept_info,
+                    "rejected": rejected_info,
                     "bins": []
                 }
 
@@ -896,7 +1005,15 @@ async def analyze_upload(
                 confidence=round(fullest.confidence, 2),
                 bins_detected=len(detections),
                 message="Image analysis complete",
-                debug_artifacts=debug_artifacts
+                debug_artifacts=debug_artifacts,
+                effective_conf=effective_conf,
+                effective_imgsz=effective_imgsz,
+                raw_count=raw_count,
+                filtered_out_count=filtered_out_count,
+                kept_count=kept_count,
+                kept_class_names=kept_class_names,
+                kept=kept_info,
+                rejected=rejected_info,
             )
 
     except HTTPException:
@@ -956,9 +1073,7 @@ async def analyze_frame(
             )
 
         area_id_value = area_id
-        imgsz_value = imgsz
         conf_value = conf
-        iou_value = iou
         if area_id_value is None and request is not None:
             query_value = request.query_params.get("area_id")
             if query_value:
@@ -966,18 +1081,10 @@ async def analyze_frame(
                     area_id_value = int(query_value)
                 except ValueError:
                     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid area_id")
-        if imgsz_value is None and request is not None:
-            query_value = request.query_params.get("imgsz")
-            if query_value:
-                imgsz_value = query_value
         if conf_value is None and request is not None:
             query_value = request.query_params.get("conf")
             if query_value:
                 conf_value = query_value
-        if iou_value is None and request is not None:
-            query_value = request.query_params.get("iou")
-            if query_value:
-                iou_value = query_value
 
         if area_id_value is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="area_id is required")
@@ -986,22 +1093,7 @@ async def analyze_frame(
         if not area:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Area not found")
 
-        imgsz_value = imgsz_value or getattr(config, "YOLO_IMAGE_SIZE", 640)
-        try:
-            imgsz_value = int(imgsz_value)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid imgsz")
-        if imgsz_value <= 0:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid imgsz")
-
-        iou_value = iou_value if iou_value is not None else 0.7
-        try:
-            iou_value = float(iou_value)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid iou")
-        if iou_value <= 0 or iou_value > 1:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid iou")
-
+        effective_conf = getattr(config, "YOLO_CONFIDENCE_THRESHOLD", 0.25)
         if conf_value is not None:
             try:
                 conf_value = float(conf_value)
@@ -1009,45 +1101,40 @@ async def analyze_frame(
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid conf")
             if conf_value < 0 or conf_value > 1:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid conf")
+            effective_conf = max(conf_value, effective_conf)
 
-        original_imgsz = config.YOLO_IMAGE_SIZE
-        original_iou = config.YOLO_IOU_THRESHOLD
-        if imgsz_value != original_imgsz:
-            config.YOLO_IMAGE_SIZE = imgsz_value
-        if iou_value != original_iou:
-            config.YOLO_IOU_THRESHOLD = iou_value
-        try:
-            detections = service.pipeline.detector.detect(
-                image,
-                confidence_threshold=conf_value,
-            )
-        finally:
-            config.YOLO_IMAGE_SIZE = original_imgsz
-            config.YOLO_IOU_THRESHOLD = original_iou
+        effective_imgsz = getattr(config, "YOLO_IMAGE_SIZE", 640)
 
-        if config.ENABLE_SECOND_STAGE_FILTER:
-            before_count = len(detections)
-            filtered = []
-            for det in detections:
-                x1, y1, x2, y2 = det.bbox
-                w = max(0, x2 - x1)
-                h = max(0, y2 - y1)
-                if w == 0 or h == 0:
-                    continue
-                area_norm = (w * h) / float(image.shape[1] * image.shape[0])
-                ar = w / h if h else 0
-                if area_norm < config.SECOND_STAGE_MIN_AREA or area_norm > config.SECOND_STAGE_MAX_AREA:
-                    continue
-                if ar < config.SECOND_STAGE_MIN_ASPECT or ar > config.SECOND_STAGE_MAX_ASPECT:
-                    continue
-                filtered.append(det)
-            detections = filtered
-            if before_count != len(detections):
-                logger.debug(
-                    "Second-stage filter: before=%s after=%s",
-                    before_count,
-                    len(detections),
-                )
+        raw_detections = service.pipeline.detector.detect_raw(
+            image,
+            confidence_threshold=effective_conf,
+        )
+
+        detections, kept_info, rejected_info, filter_stats = filter_detections_stage_a(
+            raw_detections,
+            image.shape,
+            effective_conf
+        )
+        raw_count = filter_stats["raw_count"]
+        kept_count = filter_stats["kept_count"]
+        filtered_out_count = filter_stats["filtered_out_count"]
+        kept_class_names = filter_stats["kept_class_names"]
+
+        top_reason = None
+        if kept_count == 0 and rejected_info:
+            reasons = rejected_info[0].get("reasons") or []
+            top_reason = reasons[0] if reasons else "unknown"
+        logger.info(
+            "[analyze-frame] image_size=%sx%s effective_conf=%.2f raw=%s kept=%s filtered_out=%s reason=%s",
+            image.shape[1],
+            image.shape[0],
+            effective_conf,
+            raw_count,
+            kept_count,
+            filtered_out_count,
+            top_reason or "none",
+        )
+
         if not detections:
             return {
                 "detections": [],
@@ -1055,6 +1142,14 @@ async def analyze_frame(
                 "status": "NO_BIN_DETECTED",
                 "confidence": 0.0,
                 "frame_ts": datetime.now().isoformat(),
+                "raw_count": int(raw_count),
+                "effective_conf": float(effective_conf),
+                "effective_imgsz": int(effective_imgsz),
+                "filtered_out_count": int(filtered_out_count),
+                "kept_count": int(kept_count),
+                "kept_class_names": kept_class_names,
+                "kept": kept_info,
+                "rejected": rejected_info,
             }
 
         h, w = image.shape[:2]
@@ -1088,6 +1183,14 @@ async def analyze_frame(
             "status": fullest.fill_level.value,
             "confidence": float(fullest.confidence),
             "frame_ts": datetime.now().isoformat(),
+            "raw_count": int(raw_count),
+            "effective_conf": float(effective_conf),
+            "effective_imgsz": int(effective_imgsz),
+            "filtered_out_count": int(filtered_out_count),
+            "kept_count": int(kept_count),
+            "kept_class_names": kept_class_names,
+            "kept": kept_info,
+            "rejected": rejected_info,
         }
 
         if save:
@@ -1211,6 +1314,78 @@ async def walkscan_capture(
     if not area:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Area not found")
 
+    effective_conf = getattr(config, "YOLO_CONFIDENCE_THRESHOLD", 0.25)
+    kept_count = 0
+    allowed_classes = {name.lower() for name in config.TRASH_BIN_CLASSES}
+    if detections_json:
+        try:
+            payload = json.loads(detections_json)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid detections_json")
+        detections_list = payload if isinstance(payload, list) else [payload]
+        for det in detections_list:
+            if not isinstance(det, dict):
+                continue
+            label = det.get("label") or det.get("class_name") or ""
+            label = str(label)
+            det_conf = det.get("conf")
+            if det_conf is None:
+                det_conf = det.get("confidence")
+            try:
+                det_conf = float(det_conf) if det_conf is not None else 0.0
+            except (TypeError, ValueError):
+                det_conf = 0.0
+            stable_hits = det.get("stable_hits")
+            try:
+                stable_hits = int(stable_hits) if stable_hits is not None else 0
+            except (TypeError, ValueError):
+                stable_hits = 0
+            bbox = det.get("bbox") or []
+            area_ratio = 0.0
+            touches_edge = False
+            invalid_bbox = False
+            if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                try:
+                    x1, y1, x2, y2 = [float(v) for v in bbox]
+                    if x1 < 0 or y1 < 0 or x2 > 1 or y2 > 1:
+                        pass
+                    x1c = max(0.0, min(x1, 1.0))
+                    y1c = max(0.0, min(y1, 1.0))
+                    x2c = max(0.0, min(x2, 1.0))
+                    y2c = max(0.0, min(y2, 1.0))
+                    if x2c <= x1c or y2c <= y1c:
+                        invalid_bbox = True
+                    w_box = max(0.0, x2c - x1c)
+                    h_box = max(0.0, y2c - y1c)
+                    area_ratio = w_box * h_box
+                    margin = getattr(config, "EDGE_MARGIN", 0.05)
+                    if margin > 0:
+                        if x1c <= margin or y1c <= margin or x2c >= (1 - margin) or y2c >= (1 - margin):
+                            touches_edge = True
+                except (TypeError, ValueError):
+                    invalid_bbox = True
+            else:
+                invalid_bbox = True
+
+            min_area_ratio = getattr(config, "MIN_BOX_AREA_RATIO", 0.06)
+            max_area_ratio = getattr(config, "MAX_BOX_AREA_RATIO", 0.85)
+            min_stable_hits = getattr(config, "MIN_STABLE_HITS", 5)
+            if (
+                not invalid_bbox
+                and label.lower() in allowed_classes
+                and det_conf >= effective_conf
+                and area_ratio >= min_area_ratio
+                and area_ratio <= max_area_ratio
+                and not touches_edge
+                and stable_hits >= min_stable_hits
+            ):
+                kept_count += 1
+    if kept_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No valid detections to capture"
+        )
+
     session_dir = backend_config.CAPTURES_DIR / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
     capture_id = uuid.uuid4().hex[:8]
@@ -1234,6 +1409,20 @@ async def walkscan_capture(
         )
         db.add(bin_record)
         db.flush()
+    else:
+        cooldown = getattr(config, "CAPTURE_COOLDOWN_SEC", 8)
+        if cooldown > 0:
+            last_capture = (
+                db.query(CaptureModel)
+                .filter(CaptureModel.bin_id == bin_record.id)
+                .order_by(CaptureModel.created_at.desc())
+                .first()
+            )
+            if last_capture and (datetime.utcnow() - last_capture.created_at).total_seconds() < cooldown:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Capture cooldown active"
+                )
 
     capture = CaptureModel(
         bin_id=bin_record.id,

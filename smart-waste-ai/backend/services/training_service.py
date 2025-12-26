@@ -204,7 +204,7 @@ def start_training(
                     "detect",
                     "train",
                     f"data={dataset_yaml}",
-                    f"model=yolov8{model_size}.pt",
+                    f"model=yolo12{model_size}.pt",
                     f"epochs={epochs}",
                     f"imgsz={imgsz}",
                     f"batch={batch}",
@@ -258,7 +258,7 @@ def start_training(
                     except Exception as e:
                         raise RuntimeError("Ultralytics not available. Install ultralytics.") from e
 
-                    model = YOLO(f"yolov8{model_size}.pt")
+                    model = YOLO(f"yolo12{model_size}.pt")
                     model.train(
                         data=str(dataset_yaml),
                         epochs=epochs,

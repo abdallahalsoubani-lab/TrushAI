@@ -45,11 +45,11 @@ class Config:
     # Confidence threshold for detections (0.0 - 1.0)
     # Lower = more detections (higher recall, lower precision)
     # Higher = fewer detections (lower recall, higher precision)
-    YOLO_CONFIDENCE_THRESHOLD: float = 0.25
+    YOLO_CONFIDENCE_THRESHOLD: float = 0.60
 
     # IoU (Intersection over Union) threshold for NMS
     # Used to filter overlapping bounding boxes
-    YOLO_IOU_THRESHOLD: float = 0.45
+    YOLO_IOU_THRESHOLD: float = 0.55
 
     # Maximum number of detections per image
     YOLO_MAX_DETECTIONS: int = 100
@@ -57,7 +57,7 @@ class Config:
     # Device configuration
     # Options: 'cpu', 'cuda', 'mps' (for Mac M1/M2)
     # TODO: Add automatic GPU detection and fallback logic
-    YOLO_DEVICE: str = "cpu"
+    YOLO_DEVICE: str = "mps"
 
     # Image size for YOLO inference (must be multiple of 32)
     # Larger = slower but more accurate
@@ -76,12 +76,17 @@ class Config:
     TRASH_BIN_CLASSES: list = ["trash_container"]
 
     # Alternative: Use all objects and filter by aspect ratio/size
-    DETECT_ALL_OBJECTS: bool = True  # If True, ignore TRASH_BIN_CLASSES
+    DETECT_ALL_OBJECTS: bool = False  # If True, ignore TRASH_BIN_CLASSES
 
     # Filtering criteria when DETECT_ALL_OBJECTS is True
     MIN_BOX_AREA: int = 5000  # Minimum pixels for a valid bin detection
     MIN_ASPECT_RATIO: float = 0.3  # Height/Width ratio
     MAX_ASPECT_RATIO: float = 3.0
+
+    # Hard gate for walk-scan / upload filtering (normalized ratios)
+    MIN_BOX_AREA_RATIO: float = float(os.getenv("MIN_BOX_AREA_RATIO", "0.06"))
+    MAX_BOX_AREA_RATIO: float = float(os.getenv("MAX_BOX_AREA_RATIO", "0.85"))
+    EDGE_MARGIN: float = float(os.getenv("EDGE_MARGIN", "0.05"))
 
     # Second-stage filter for walk-scan (post YOLO)
     ENABLE_SECOND_STAGE_FILTER: bool = os.getenv("ENABLE_SECOND_STAGE_FILTER", "True").lower() == "true"
@@ -89,6 +94,10 @@ class Config:
     SECOND_STAGE_MAX_AREA: float = float(os.getenv("SECOND_STAGE_MAX_AREA", "0.85"))
     SECOND_STAGE_MIN_ASPECT: float = float(os.getenv("SECOND_STAGE_MIN_ASPECT", "0.3"))
     SECOND_STAGE_MAX_ASPECT: float = float(os.getenv("SECOND_STAGE_MAX_ASPECT", "3.5"))
+
+    # Walk-scan capture gating (server-side)
+    MIN_STABLE_HITS: int = int(os.getenv("MIN_STABLE_HITS", "5"))
+    CAPTURE_COOLDOWN_SEC: float = float(os.getenv("CAPTURE_COOLDOWN_SEC", "8"))
 
     # Optional segmentation hook (disabled by default)
     ENABLE_SEGMENTATION: bool = os.getenv("ENABLE_SEGMENTATION", "False").lower() == "true"

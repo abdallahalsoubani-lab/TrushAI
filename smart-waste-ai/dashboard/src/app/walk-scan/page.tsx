@@ -5,6 +5,12 @@ import Link from "next/link";
 import "../globals.css";
 
 const API_BASE = "http://localhost:8000";
+const DEFAULT_CONF = 0.8;
+const DEFAULT_IMGSZ = 640;
+const DEFAULT_MIN_AREA = 0.06;
+const DEFAULT_MIN_STABLE_HITS = 5;
+const DEFAULT_COOLDOWN_SEC = 8;
+const DEFAULT_EDGE_MARGIN = 0.05;
 
 type Detection = {
   bbox: [number, number, number, number];
@@ -66,10 +72,10 @@ export default function WalkScanPage() {
   });
   const sessionIdRef = useRef<string>(sessionId);
   const [minConf, setMinConf] = useState(() => {
-    if (typeof window === "undefined") return 0.25;
+    if (typeof window === "undefined") return DEFAULT_CONF;
     const stored = window.localStorage.getItem("walkscan_minConf");
-    const value = stored ? Number(stored) : 0.25;
-    return Number.isFinite(value) ? value : 0.25;
+    const value = stored ? Number(stored) : DEFAULT_CONF;
+    return Number.isFinite(value) ? value : DEFAULT_CONF;
   });
   const [maxArea, setMaxArea] = useState(() => {
     if (typeof window === "undefined") return 0.85;
@@ -78,28 +84,28 @@ export default function WalkScanPage() {
     return Number.isFinite(value) ? value : 0.85;
   });
   const [minArea, setMinArea] = useState(() => {
-    if (typeof window === "undefined") return 0.03;
+    if (typeof window === "undefined") return DEFAULT_MIN_AREA;
     const stored = window.localStorage.getItem("walkscan_minArea");
-    const value = stored ? Number(stored) : 0.03;
-    return Number.isFinite(value) ? value : 0.03;
+    const value = stored ? Number(stored) : DEFAULT_MIN_AREA;
+    return Number.isFinite(value) ? value : DEFAULT_MIN_AREA;
   });
   const [minStableHits, setMinStableHits] = useState(() => {
-    if (typeof window === "undefined") return 3;
+    if (typeof window === "undefined") return DEFAULT_MIN_STABLE_HITS;
     const stored = window.localStorage.getItem("walkscan_minStableHits");
-    const value = stored ? Number(stored) : 3;
-    return Number.isFinite(value) ? value : 3;
+    const value = stored ? Number(stored) : DEFAULT_MIN_STABLE_HITS;
+    return Number.isFinite(value) ? value : DEFAULT_MIN_STABLE_HITS;
   });
   const [imgsz, setImgsz] = useState(() => {
-    if (typeof window === "undefined") return 640;
+    if (typeof window === "undefined") return DEFAULT_IMGSZ;
     const stored = window.localStorage.getItem("walkscan_imgsz");
-    const value = stored ? Number(stored) : 640;
-    return Number.isFinite(value) ? value : 640;
+    const value = stored ? Number(stored) : DEFAULT_IMGSZ;
+    return Number.isFinite(value) ? value : DEFAULT_IMGSZ;
   });
   const [processEveryNFrames, setProcessEveryNFrames] = useState(1);
   const [minAspect, setMinAspect] = useState(0.3);
   const [maxAspect, setMaxAspect] = useState(3.5);
-  const [edgeMargin, setEdgeMargin] = useState(0.02);
-  const [captureCooldownSec, setCaptureCooldownSec] = useState(4);
+  const [edgeMargin, setEdgeMargin] = useState(DEFAULT_EDGE_MARGIN);
+  const [captureCooldownSec, setCaptureCooldownSec] = useState(DEFAULT_COOLDOWN_SEC);
   const [lastApiInfo, setLastApiInfo] = useState<{
     binsDetected: number;
     latencyMs: number;
@@ -335,9 +341,13 @@ export default function WalkScanPage() {
       const query = new URLSearchParams({
         session_id: currentSessionId,
         area_id: String(currentAreaId),
-        imgsz: String(imgsz),
-        conf: String(minConf),
       });
+      if (Math.abs(minConf - DEFAULT_CONF) > 1e-3) {
+        query.set("conf", String(minConf));
+      }
+      if (imgsz !== DEFAULT_IMGSZ) {
+        query.set("imgsz", String(imgsz));
+      }
       const start = performance.now();
       const res = await fetch(`${API_BASE}/api/v1/analyze-frame?${query.toString()}`, {
         method: "POST",
@@ -382,7 +392,10 @@ export default function WalkScanPage() {
           captureForm.append("track_id", det.track_id.toString());
           captureForm.append("status", det.fill_status);
           captureForm.append("confidence", det.fill_conf.toString());
-          captureForm.append("detections_json", JSON.stringify(det));
+          captureForm.append(
+            "detections_json",
+            JSON.stringify({ ...det, stable_hits: meta.hits })
+          );
 
           const captureRes = await fetch(`${API_BASE}/api/v1/walkscan/capture`, {
             method: "POST",
@@ -436,8 +449,14 @@ export default function WalkScanPage() {
       setRunning(true);
       setError(null);
     } catch (err) {
+      console.error("Camera start failed", err);
       setError(err instanceof Error ? err.message : "Camera permission denied");
     }
+  };
+
+  const reconnectCamera = async () => {
+    stopScan();
+    await startScan();
   };
 
   const stopScan = () => {
@@ -696,6 +715,12 @@ export default function WalkScanPage() {
                   Stop
                 </button>
               )}
+              <button
+                onClick={reconnectCamera}
+                className="px-4 py-2 rounded bg-yellow-500 text-white hover:bg-yellow-600"
+              >
+                Reconnect Camera
+              </button>
               <button
                 onClick={clearCaptures}
                 className="px-4 py-2 rounded bg-gray-200 text-gray-700 hover:bg-gray-300"
