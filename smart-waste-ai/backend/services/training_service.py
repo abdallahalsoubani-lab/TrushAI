@@ -10,8 +10,9 @@ import shutil
 import subprocess
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 from backend.config import config as backend_config
 from ai.config import config as ai_config
@@ -69,6 +70,24 @@ def _get_run_dir(run_name: str) -> Path:
     return _get_runs_root() / run_name
 
 
+def _count_files(target: Path) -> int:
+    if not target.exists():
+        return 0
+    return sum(1 for path in target.rglob("*") if path.is_file())
+
+
+def _safe_clear_dir(target: Path, base: Path) -> int:
+    resolved = target.resolve()
+    base_resolved = base.resolve()
+    if resolved != base_resolved and base_resolved not in resolved.parents:
+        raise ValueError(f"Refusing to delete outside training dir: {resolved}")
+    deleted = _count_files(resolved)
+    if resolved.exists():
+        shutil.rmtree(resolved)
+    resolved.mkdir(parents=True, exist_ok=True)
+    return deleted
+
+
 def _get_artifacts(run_dir: Path) -> Dict[str, Optional[str]]:
     weights_dir = run_dir / "weights"
     artifacts = {
@@ -81,6 +100,60 @@ def _get_artifacts(run_dir: Path) -> Dict[str, Optional[str]]:
         "results_csv": str(run_dir / "results.csv") if (run_dir / "results.csv").exists() else None,
     }
     return artifacts
+
+
+def _candidate_info(paths: List[Path]) -> List[Dict[str, str]]:
+    info = []
+    for path in paths:
+        try:
+            mtime = datetime.utcfromtimestamp(path.stat().st_mtime).isoformat() + "Z"
+        except Exception:
+            mtime = None
+        info.append({"path": str(path), "mtime": mtime})
+    return info
+
+
+def _search_best_candidates() -> Tuple[List[Path], List[str]]:
+    training_root = backend_config.TRAINING_DIR.resolve()
+    roots = [training_root / "runs", training_root]
+    searched_roots = [str(root) for root in roots]
+    candidates: List[Path] = []
+    seen = set()
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in root.rglob("best.pt"):
+            if path.parent.name != "weights":
+                continue
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            if training_root not in resolved.parents:
+                continue
+            seen.add(resolved)
+            candidates.append(resolved)
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates, searched_roots
+
+
+def get_last_best_info() -> Dict:
+    candidates, searched_roots = _search_best_candidates()
+    info = _candidate_info(candidates)
+    if not candidates:
+        return {
+            "ok": False,
+            "best_pt": None,
+            "candidates": info,
+            "searched_roots": searched_roots,
+        }
+    best = candidates[0]
+    return {
+        "ok": True,
+        "best_pt": str(best),
+        "mtime": datetime.utcfromtimestamp(best.stat().st_mtime).isoformat() + "Z",
+        "searched_roots": searched_roots,
+        "candidates": info,
+    }
 
 
 def _find_latest_run_dir() -> Optional[Path]:
@@ -320,3 +393,92 @@ def use_model(weights_path: str) -> Dict:
     service.initialize_models()
 
     return service.get_service_info()
+
+
+def reset_dataset() -> Dict:
+    try:
+        training_root = backend_config.TRAINING_DIR
+        images_deleted = _safe_clear_dir(backend_config.TRAINING_IMAGES_RAW, training_root)
+        labels_deleted = _safe_clear_dir(backend_config.TRAINING_LABELS_RAW, training_root)
+        splits_deleted = _safe_clear_dir(backend_config.TRAINING_DATASET_DIR, training_root)
+
+        runs_root = _get_runs_root()
+        runs_removed = 0
+        if runs_root.exists():
+            runs_removed = sum(1 for p in runs_root.iterdir() if p.is_dir())
+            _safe_clear_dir(runs_root, training_root)
+
+        if backend_config.TRAINING_STATUS_FILE.exists():
+            backend_config.TRAINING_STATUS_FILE.unlink()
+        if backend_config.TRAINING_LOG_FILE.exists():
+            backend_config.TRAINING_LOG_FILE.unlink()
+
+        return {
+            "ok": True,
+            "deleted": {
+                "images": images_deleted,
+                "labels": labels_deleted,
+                "splits": splits_deleted,
+                "runs_removed": runs_removed,
+            },
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def deploy_best(from_path: Optional[str] = None) -> Dict:
+    training_root = backend_config.TRAINING_DIR.resolve()
+
+    if from_path:
+        best_src = Path(from_path).expanduser().resolve()
+        if training_root not in best_src.parents and best_src != training_root:
+            return {"error": "best.pt path is outside training dir"}
+        if best_src.name != "best.pt":
+            return {"error": "from_path must point to best.pt"}
+        if not best_src.exists():
+            return {"error": "best.pt not found"}
+        searched_roots = [str(training_root / "runs"), str(training_root)]
+        candidates_info = _candidate_info([best_src])
+    else:
+        last_best = get_last_best_info()
+        if not last_best.get("ok"):
+            return {
+                "error": "best.pt not found",
+                "searched_roots": last_best.get("searched_roots", []),
+                "candidates": last_best.get("candidates", []),
+            }
+        best_src = Path(last_best["best_pt"]).resolve()
+        searched_roots = last_best.get("searched_roots", [])
+        candidates_info = last_best.get("candidates", [])
+
+    backend_config.TRAINING_WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+    dest_path = backend_config.TRAINING_WEIGHTS_DIR / "bins.pt"
+
+    backup_path = None
+    if dest_path.exists():
+        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+        backup_path = dest_path.with_name(f"bins.prev.{timestamp}.pt")
+        shutil.copy2(dest_path, backup_path)
+
+    shutil.copy2(best_src, dest_path)
+
+    ai_config.YOLO_WEIGHTS_PATH = str(dest_path)
+    ai_config.DETECT_ALL_OBJECTS = False
+    ai_config.TRASH_BIN_CLASSES = ["trash_container"]
+
+    restart_required = False
+    try:
+        service = get_inference_service()
+        service.initialize_models()
+    except Exception:
+        restart_required = True
+
+    return {
+        "ok": True,
+        "from": str(best_src),
+        "to": str(dest_path),
+        "backup": str(backup_path) if backup_path else None,
+        "restart_required": restart_required,
+        "searched_roots": searched_roots,
+        "candidates": candidates_info,
+    }

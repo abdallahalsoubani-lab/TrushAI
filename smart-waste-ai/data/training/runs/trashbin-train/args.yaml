@@ -1,6 +1,6 @@
 task: detect
 mode: train
-model: yolov8n.pt
+model: yolo12n.pt
 data: /Users/soubani/Desktop/TrushAI/smart-waste-ai/data/training/dataset/dataset.yaml
 epochs: 50
 time: null

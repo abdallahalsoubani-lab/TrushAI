@@ -41,6 +41,7 @@ export default function TrainingPanel({ datasetReady, datasetYamlPath }: Trainin
     artifacts: {},
   });
   const [message, setMessage] = useState<string | null>(null);
+  const [deploying, setDeploying] = useState(false);
 
   const fetchStatus = async () => {
     const res = await fetch(`${API_BASE}/train/status`);
@@ -80,19 +81,22 @@ export default function TrainingPanel({ datasetReady, datasetYamlPath }: Trainin
     setMessage("Training started");
   };
 
-  const handleUseModel = async () => {
+  const handleDeployBest = async () => {
     if (!status.artifacts.best_pt) return;
-    const res = await fetch(`${API_BASE}/train/use-model`, {
+    setDeploying(true);
+    setMessage(null);
+    const res = await fetch(`${API_BASE}/training/deploy-best`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ weights_path: status.artifacts.best_pt }),
     });
     const data = await res.json();
     if (!res.ok) {
-      setMessage(data.detail || "Failed to activate model");
+      setMessage(data.detail || "Failed to deploy model");
+      setDeploying(false);
       return;
     }
-    setMessage("Model activated for inference");
+    const target = data.to || "backend/weights/bins.pt";
+    setMessage(`Model deployed to ${target}`);
+    setDeploying(false);
   };
 
   const progress = status.epochs > 0 ? Math.round((status.epoch / status.epochs) * 100) : 0;
@@ -230,10 +234,11 @@ export default function TrainingPanel({ datasetReady, datasetYamlPath }: Trainin
             Download best.pt
           </a>
           <button
-            onClick={handleUseModel}
-            className="px-4 py-2 rounded bg-green-600 text-white hover:bg-green-700"
+            onClick={handleDeployBest}
+            disabled={deploying}
+            className="px-4 py-2 rounded bg-green-600 text-white hover:bg-green-700 disabled:bg-gray-300"
           >
-            Use This Model
+            {deploying ? "Deploying..." : "Deploy best.pt"}
           </button>
         </div>
       )}

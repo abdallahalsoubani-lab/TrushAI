@@ -2180,6 +2180,21 @@ async def dataset_prepare(request: PrepareDatasetRequest):
 
 
 @router.post(
+    "/training/dataset/reset",
+    summary="Reset Training Dataset",
+    description="Delete all training images, labels, splits, and related runs"
+)
+async def training_dataset_reset():
+    result = training_service.reset_dataset()
+    if result.get("error"):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=result["error"]
+        )
+    return result
+
+
+@router.post(
     "/train/start",
     summary="Start Training",
     description="Start YOLOv8 training in background"
@@ -2317,6 +2332,46 @@ async def train_use_model(request: UseModelRequest):
             detail=result["error"]
         )
     return result
+
+
+@router.post(
+    "/training/deploy-best",
+    summary="Deploy Best Weights",
+    description="Copy latest best.pt into backend/weights/bins.pt with backup"
+)
+async def training_deploy_best(request: Request):
+    from_path = request.query_params.get("path")
+    if not from_path:
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            payload = await request.json()
+            from_path = payload.get("from_path") if isinstance(payload, dict) else None
+            if not from_path:
+                from_path = payload.get("path") if isinstance(payload, dict) else None
+        else:
+            form = await request.form()
+            from_path = form.get("from_path") or form.get("path")
+
+    result = training_service.deploy_best(from_path)
+    if result.get("error"):
+        error_text = str(result["error"]).lower()
+        if "outside training dir" in error_text or "from_path" in error_text:
+            status_code = status.HTTP_400_BAD_REQUEST
+        elif "not found" in error_text:
+            status_code = status.HTTP_404_NOT_FOUND
+        else:
+            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        raise HTTPException(status_code=status_code, detail=result)
+    return result
+
+
+@router.get(
+    "/training/last-best",
+    summary="Locate Latest best.pt",
+    description="Return latest best.pt path and search diagnostics"
+)
+async def training_last_best():
+    return training_service.get_last_best_info()
 
 
 @router.get(

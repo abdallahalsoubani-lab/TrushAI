@@ -30,6 +30,11 @@ export default function DatasetManager({ onPrepared }: DatasetManagerProps) {
   const [selected, setSelected] = useState<ImageItem | null>(null);
   const [prepareInfo, setPrepareInfo] = useState<string | null>(null);
   const [prepareError, setPrepareError] = useState<string | null>(null);
+  const [resetOpen, setResetOpen] = useState(false);
+  const [resetInput, setResetInput] = useState("");
+  const [resetBusy, setResetBusy] = useState(false);
+  const [resetMessage, setResetMessage] = useState<string | null>(null);
+  const [resetError, setResetError] = useState<string | null>(null);
 
   const totalPages = Math.max(1, Math.ceil(images.length / PAGE_SIZE));
   const pageImages = images.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
@@ -88,6 +93,36 @@ export default function DatasetManager({ onPrepared }: DatasetManagerProps) {
     onPrepared(data);
   };
 
+  const handleResetDataset = async () => {
+    if (resetInput !== "DELETE") return;
+    setResetBusy(true);
+    setResetMessage(null);
+    setResetError(null);
+    try {
+      const res = await fetch(`${API_BASE}/training/dataset/reset`, {
+        method: "POST",
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setResetError(data.detail || "Failed to reset dataset");
+        return;
+      }
+      setImages([]);
+      setPage(1);
+      setPrepareInfo(null);
+      setPrepareError(null);
+      onPrepared(null);
+      setResetMessage("Dataset cleared. You can upload new images.");
+      await fetchImages();
+    } catch {
+      setResetError("Failed to reset dataset");
+    } finally {
+      setResetBusy(false);
+      setResetOpen(false);
+      setResetInput("");
+    }
+  };
+
   return (
     <div className="bg-white rounded-lg shadow-md p-6">
       <div className="flex items-center justify-between mb-4">
@@ -95,19 +130,33 @@ export default function DatasetManager({ onPrepared }: DatasetManagerProps) {
           <h2 className="text-xl font-semibold text-gray-900">Dataset Manager</h2>
           <p className="text-sm text-gray-500">Upload and annotate images</p>
         </div>
-        <label className="px-4 py-2 bg-blue-600 text-white rounded-lg cursor-pointer hover:bg-blue-700">
-          Upload Images
-          <input
-            type="file"
-            multiple
-            accept="image/jpeg,image/jpg,image/png"
-            className="hidden"
-            onChange={(e) => handleUpload(e.target.files)}
-          />
-        </label>
+        <div className="flex items-center gap-2">
+          <label className="px-4 py-2 bg-blue-600 text-white rounded-lg cursor-pointer hover:bg-blue-700">
+            Upload Images
+            <input
+              type="file"
+              multiple
+              accept="image/jpeg,image/jpg,image/png"
+              className="hidden"
+              onChange={(e) => handleUpload(e.target.files)}
+            />
+          </label>
+          <button
+            onClick={() => {
+              setResetOpen(true);
+              setResetMessage(null);
+              setResetError(null);
+            }}
+            className="px-4 py-2 rounded bg-red-600 text-white hover:bg-red-700"
+          >
+            Delete All Dataset
+          </button>
+        </div>
       </div>
 
       {loading && <p className="text-sm text-gray-600 mb-4">Uploading...</p>}
+      {resetMessage && <p className="text-sm text-green-600 mb-4">{resetMessage}</p>}
+      {resetError && <p className="text-sm text-red-600 mb-4">{resetError}</p>}
 
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
         {pageImages.map((img) => (
@@ -170,6 +219,43 @@ export default function DatasetManager({ onPrepared }: DatasetManagerProps) {
           onClose={() => setSelected(null)}
           onSave={handleSaveAnnotation}
         />
+      )}
+
+      {resetOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="bg-white rounded-lg shadow-lg p-6 w-full max-w-md">
+            <h3 className="text-lg font-semibold text-gray-900 mb-2">Delete All Dataset</h3>
+            <p className="text-sm text-gray-600 mb-4">
+              This will permanently delete all uploaded images, annotations, and dataset splits. Continue?
+            </p>
+            <label className="text-xs text-gray-500">Type DELETE to confirm</label>
+            <input
+              type="text"
+              value={resetInput}
+              onChange={(e) => setResetInput(e.target.value)}
+              className="w-full border rounded px-3 py-2 mt-1"
+              placeholder="DELETE"
+            />
+            <div className="mt-4 flex items-center justify-end gap-2">
+              <button
+                onClick={() => {
+                  setResetOpen(false);
+                  setResetInput("");
+                }}
+                className="px-3 py-2 rounded bg-gray-200 hover:bg-gray-300"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleResetDataset}
+                disabled={resetInput !== "DELETE" || resetBusy}
+                className="px-3 py-2 rounded bg-red-600 text-white hover:bg-red-700 disabled:bg-gray-300"
+              >
+                {resetBusy ? "Deleting..." : "Confirm Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
